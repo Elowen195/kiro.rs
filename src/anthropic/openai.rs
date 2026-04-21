@@ -704,10 +704,10 @@ impl OpenAIStreamState {
 
     fn wrap_chunk(&self, choices: Value) -> String {
         let chunk = json!({
-            "id": self.id,
+            "id": self.id.clone(),
             "object": "chat.completion.chunk",
             "created": self.created,
-            "model": self.model,
+            "model": self.model.clone(),
             "choices": choices,
         });
         format!(
@@ -736,7 +736,7 @@ impl OpenAIStreamState {
             Event::AssistantResponse(resp) => {
                 self.output_tokens += (resp.content.len() / 4).max(1) as i32;
                 out.push(self.wrap_chunk(json!([
-                    {"index":0, "delta": {"content": resp.content}, "finish_reason": null}
+                    {"index":0, "delta": {"content": resp.content.clone()}, "finish_reason": null}
                 ])));
             }
             Event::ToolUse(tu) => {
@@ -764,9 +764,9 @@ impl OpenAIStreamState {
                             "delta": {
                                 "tool_calls": [{
                                     "index": idx,
-                                    "id": tu.tool_use_id,
+                                    "id": tu.tool_use_id.clone(),
                                     "type": "function",
-                                    "function": {"name": original_name, "arguments": tu.input},
+                                    "function": {"name": original_name, "arguments": tu.input.clone()},
                                 }]
                             },
                             "finish_reason": null
@@ -779,7 +779,7 @@ impl OpenAIStreamState {
                             "delta": {
                                 "tool_calls": [{
                                     "index": idx,
-                                    "function": {"arguments": tu.input},
+                                    "function": {"arguments": tu.input.clone()},
                                 }]
                             },
                             "finish_reason": null
@@ -827,14 +827,14 @@ impl OpenAIStreamState {
             "total_tokens": prompt_tokens + self.output_tokens,
         });
         let chunk = json!({
-            "id": self.id,
+            "id": self.id.clone(),
             "object": "chat.completion.chunk",
             "created": self.created,
-            "model": self.model,
+            "model": self.model.clone(),
             "choices": [{
                 "index": 0,
                 "delta": {},
-                "finish_reason": self.finish_reason,
+                "finish_reason": self.finish_reason.clone(),
             }],
             "usage": usage,
         });
