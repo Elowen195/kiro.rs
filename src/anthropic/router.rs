@@ -12,6 +12,7 @@ use crate::kiro::provider::KiroProvider;
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
+    openai::post_chat_completions,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -49,6 +50,7 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        .route("/chat/completions", post(post_chat_completions))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

@@ -97,12 +97,13 @@ pub struct UserInputMessage {
     pub user_input_message_context: UserInputMessageContext,
     /// 消息内容
     pub content: String,
-    /// 模型 ID
+    /// 模型 ID（CLI 端点下可能留空）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model_id: String,
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
-    /// 消息来源（通常为 "AI_EDITOR"）
+    /// 消息来源（通常为 "AI_EDITOR" 或 "KIRO_CLI"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 }
@@ -138,6 +139,19 @@ impl UserInputMessage {
     }
 }
 
+/// 环境状态
+///
+/// CLI 端点下 userInputMessageContext 必须携带 envState，
+/// 缺失会导致上游返回 400 "Improperly formed request"。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvState {
+    /// 操作系统（linux / macos / windows）
+    pub operating_system: String,
+    /// 当前工作目录
+    pub current_working_directory: String,
+}
+
 /// 用户输入消息上下文
 ///
 /// 包含工具定义和工具执行结果
@@ -150,6 +164,9 @@ pub struct UserInputMessageContext {
     /// 可用工具列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+    /// 环境状态（CLI 端点下必需）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_state: Option<EnvState>,
 }
 
 impl UserInputMessageContext {
@@ -167,6 +184,12 @@ impl UserInputMessageContext {
     /// 设置工具结果
     pub fn with_tool_results(mut self, results: Vec<ToolResult>) -> Self {
         self.tool_results = results;
+        self
+    }
+
+    /// 设置环境状态
+    pub fn with_env_state(mut self, env_state: EnvState) -> Self {
+        self.env_state = Some(env_state);
         self
     }
 }
@@ -235,7 +258,8 @@ impl HistoryUserMessage {
 pub struct UserMessage {
     /// 消息内容
     pub content: String,
-    /// 模型 ID
+    /// 模型 ID（CLI 端点下可能留空）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model_id: String,
     /// 消息来源
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,7 +273,7 @@ pub struct UserMessage {
 }
 
 fn is_default_context(ctx: &UserInputMessageContext) -> bool {
-    ctx.tools.is_empty() && ctx.tool_results.is_empty()
+    ctx.tools.is_empty() && ctx.tool_results.is_empty() && ctx.env_state.is_none()
 }
 
 impl UserMessage {

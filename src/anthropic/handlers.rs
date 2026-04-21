@@ -69,107 +69,99 @@ fn map_provider_error(err: Error) -> Response {
 
 /// GET /v1/models
 ///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+/// 优先从上游 CLI 端点的 `ListAvailableModels` 动态获取模型列表；
+/// 失败时回退到硬编码列表。
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
+    if let Some(provider) = state.kiro_provider.as_ref() {
+        match provider.call_list_models().await {
+            Ok(upstream) => {
+                let models = parse_upstream_models(&upstream);
+                if !models.is_empty() {
+                    return Json(ModelsResponse {
+                        object: "list".to_string(),
+                        data: models,
+                    });
+                }
+                tracing::warn!("上游 ListAvailableModels 返回空列表，回退到硬编码");
+            }
+            Err(e) => {
+                tracing::warn!("获取上游模型列表失败，回退到硬编码: {}", e);
+            }
+        }
+    }
+
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: fallback_models(),
+    })
+}
+
+/// 将上游 `ListAvailableModels` 响应映射为 Anthropic `/v1/models` 格式
+fn parse_upstream_models(upstream: &serde_json::Value) -> Vec<Model> {
+    let Some(models) = upstream.get("models").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    models
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("modelId").and_then(|v| v.as_str())?;
+            // 过滤 "auto" 等虚拟模型
+            if id.eq_ignore_ascii_case("auto") {
+                return None;
+            }
+            let display_name = m
+                .get("modelName")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
+            let max_tokens = m
+                .get("tokenLimits")
+                .and_then(|v| v.get("maxInputTokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(200_000) as i32;
+            let owned_by = if id.to_lowercase().contains("claude") {
+                "anthropic"
+            } else {
+                "amazon"
+            };
+            Some(Model {
+                id: id.to_string(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: owned_by.to_string(),
+                display_name,
+                model_type: "chat".to_string(),
+                max_tokens,
+            })
+        })
+        .collect()
+}
+
+/// 回退模型列表（当上游调用失败时使用）
+fn fallback_models() -> Vec<Model> {
+    vec![
         Model {
             id: "claude-sonnet-4-5-20250929".to_string(),
             object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
+            created: 1759104000,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: 200_000,
         },
         Model {
             id: "claude-sonnet-4-5-20250929-thinking".to_string(),
             object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
+            created: 1759104000,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: 200_000,
         },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ];
-
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
+    ]
 }
 
 /// POST /v1/messages
@@ -625,7 +617,7 @@ async fn handle_non_stream_request(
 /// - Opus 4.6：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;

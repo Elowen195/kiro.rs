@@ -156,7 +156,7 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_endpoint() -> String {
-    crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
+    crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME.to_string()
 }
 
 impl Default for Config {

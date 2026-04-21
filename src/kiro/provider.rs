@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::endpoint::cli::{CLI_ENDPOINT_NAME, CliEndpoint};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -123,6 +124,54 @@ impl KiroProvider {
     /// 发送 MCP API 请求（WebSearch 等工具调用）
     pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         self.call_mcp_with_retry(request_body).await
+    }
+
+    /// 调用 CLI 端点的 ListAvailableModels 接口
+    ///
+    /// 需要 `cli` 端点已注册（`main.rs` 里默认注册了）。
+    /// 返回上游原始 JSON 响应（含 `models` 数组）。
+    ///
+    /// 注意：无论凭据 `endpoint` 字段是什么，这里都用 CliEndpoint 发起请求，
+    /// 因为 IDE 端点没有公开的 list models API。
+    pub async fn call_list_models(&self) -> anyhow::Result<serde_json::Value> {
+        // 要求 CLI 端点已注册；因为 CliEndpoint 无状态，直接实例化使用即可
+        if !self.endpoints.contains_key(CLI_ENDPOINT_NAME) {
+            anyhow::bail!("CLI 端点未注册，无法调用 ListAvailableModels");
+        }
+        let cli = CliEndpoint::new();
+
+        let ctx = self.token_manager.acquire_context(None).await?;
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+
+        let rctx = RequestContext {
+            credentials: &ctx.credentials,
+            token: &ctx.token,
+            machine_id: &machine_id,
+            config,
+        };
+
+        let spec = cli.list_models_spec(&rctx);
+        let base = self
+            .client_for(&ctx.credentials)?
+            .post(&spec.url)
+            .body(spec.body.clone())
+            .header("Connection", "close");
+        let request = cli.decorate_list_models(base, &rctx);
+
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            anyhow::bail!("ListAvailableModels 调用失败: {} {}", status, body);
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("解析 ListAvailableModels 响应失败: {}: {}", e, body))?;
+
+        self.token_manager.report_success(ctx.id);
+        Ok(json)
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
