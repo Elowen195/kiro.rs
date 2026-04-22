@@ -227,7 +227,7 @@ fn adapt_body_for_cli(body: &str) -> String {
         return serde_json::to_string(&json).unwrap_or_else(|_| body.to_string());
     };
 
-    if let serde_json::Value::Object(ref mut state_obj) = state {
+    if let serde_json::Value::Object(state_obj) = state {
         state_obj.remove("agentContinuationId");
         state_obj.remove("agentTaskType");
         state_obj.remove("chatTriggerType");
@@ -238,7 +238,7 @@ fn adapt_body_for_cli(body: &str) -> String {
         .get_mut("currentMessage")
         .and_then(|v| v.get_mut("userInputMessage"))
     {
-        if let serde_json::Value::Object(ref mut obj) = current {
+        if let serde_json::Value::Object(obj) = current {
             obj.remove("modelId");
             obj.remove("origin");
             inject_env_state(obj);
@@ -251,7 +251,7 @@ fn adapt_body_for_cli(body: &str) -> String {
             let Some(user) = msg.get_mut("userInputMessage") else {
                 continue;
             };
-            if let serde_json::Value::Object(ref mut obj) = user {
+            if let serde_json::Value::Object(obj) = user {
                 obj.remove("modelId");
                 obj.insert(
                     "origin".to_string(),
@@ -270,7 +270,7 @@ fn inject_env_state(obj: &mut serde_json::Map<String, serde_json::Value>) {
     let ctx = obj
         .entry("userInputMessageContext".to_string())
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if let serde_json::Value::Object(ref mut ctx_obj) = ctx {
+    if let serde_json::Value::Object(ctx_obj) = ctx {
         if !ctx_obj.contains_key("envState") {
             ctx_obj.insert("envState".to_string(), CliEndpoint::env_state());
         }

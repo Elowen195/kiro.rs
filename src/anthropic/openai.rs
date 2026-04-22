@@ -584,7 +584,8 @@ async fn handle_non_stream(
     // 剥离 <thinking>...</thinking>（OpenAI 没等价概念，直接丢弃）
     let (_, visible_text) = super::stream::extract_thinking_from_complete_text(&text);
 
-    let output_tokens = token::estimate_output_tokens(&json!([{"type":"text","text":visible_text}]));
+    let output_content = [json!({"type":"text","text":visible_text})];
+    let output_tokens = token::estimate_output_tokens(&output_content);
     let input_tokens = context_input_tokens.unwrap_or(estimated_input_tokens);
 
     let completion = ChatCompletion {
