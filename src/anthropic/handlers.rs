@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -24,7 +24,10 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -178,6 +181,13 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    override_thinking_from_model_name(&mut payload);
+
+    if let Some(response) = maybe_handle_local_cli(&payload, state.extract_thinking).await {
+        return response;
+    }
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -193,9 +203,6 @@ pub async fn post_messages(
                 .into_response();
         }
     };
-
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -287,7 +294,15 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -307,7 +322,8 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -497,14 +513,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -523,10 +539,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -612,6 +627,147 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
+async fn maybe_handle_local_cli(
+    payload: &MessagesRequest,
+    extract_thinking: bool,
+) -> Option<Response> {
+    if !super::local_cli::supports_model(&payload.model) {
+        return None;
+    }
+
+    tracing::info!(model = %payload.model, "命中本地 kiro-cli glm-5 回退路径");
+
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let thinking_enabled = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
+
+    Some(if payload.stream {
+        handle_local_cli_stream_request(payload, input_tokens, thinking_enabled).await
+    } else {
+        handle_local_cli_non_stream_request(
+            payload,
+            input_tokens,
+            extract_thinking && thinking_enabled,
+        )
+        .await
+    })
+}
+
+async fn handle_local_cli_non_stream_request(
+    payload: &MessagesRequest,
+    input_tokens: i32,
+    thinking_enabled: bool,
+) -> Response {
+    let text_content = match super::local_cli::complete(payload).await {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::error!("本地 kiro-cli 调用失败: {}", e);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("本地 kiro-cli 调用失败: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let mut content: Vec<serde_json::Value> = Vec::new();
+    if thinking_enabled {
+        let (thinking, remaining_text) =
+            super::stream::extract_thinking_from_complete_text(&text_content);
+
+        if let Some(thinking_text) = thinking {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": thinking_text
+            }));
+        }
+
+        if !remaining_text.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": remaining_text
+            }));
+        }
+    } else if !text_content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": text_content
+        }));
+    }
+
+    let output_tokens = token::estimate_output_tokens(&content);
+    let response_body = json!({
+        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": payload.model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+
+    (StatusCode::OK, Json(response_body)).into_response()
+}
+
+async fn handle_local_cli_stream_request(
+    payload: &MessagesRequest,
+    input_tokens: i32,
+    thinking_enabled: bool,
+) -> Response {
+    let text_content = match super::local_cli::complete(payload).await {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::error!("本地 kiro-cli 调用失败: {}", e);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("本地 kiro-cli 调用失败: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let mut ctx = StreamContext::new_with_thinking(
+        &payload.model,
+        input_tokens,
+        thinking_enabled,
+        std::collections::HashMap::new(),
+    );
+    let mut events = ctx.generate_initial_events();
+    events.extend(ctx.process_assistant_response(&text_content));
+    events.extend(ctx.generate_final_events());
+
+    let bytes: Vec<Result<Bytes, Infallible>> = events
+        .into_iter()
+        .map(|event| Ok(Bytes::from(event.to_sse_string())))
+        .collect();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream::iter(bytes)))
+        .unwrap()
+}
+
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
 /// - Opus 4.6：覆写为 adaptive 类型
@@ -623,14 +779,10 @@ pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -642,7 +794,7 @@ pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -691,6 +843,13 @@ pub async fn post_messages_cc(
         "Received POST /cc/v1/messages request"
     );
 
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    override_thinking_from_model_name(&mut payload);
+
+    if let Some(response) = maybe_handle_local_cli(&payload, state.extract_thinking).await {
+        return response;
+    }
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -706,9 +865,6 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
-
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -800,7 +956,15 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -823,7 +987,12 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

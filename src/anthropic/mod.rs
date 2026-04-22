@@ -24,6 +24,7 @@
 
 mod converter;
 mod handlers;
+mod local_cli;
 mod middleware;
 mod openai;
 mod router;
