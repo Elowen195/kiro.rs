@@ -94,7 +94,10 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           push: true
+          provenance: false
           # 引用步骤中生成的 owner 变量
           tags: ghcr.io/${{ steps.repo_owner.outputs.owner }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
