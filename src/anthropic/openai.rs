@@ -582,7 +582,7 @@ async fn handle_non_stream(
 ) -> Response {
     let response = match provider.call_api(&request_body).await {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, Some(&request_body)),
     };
 
     let body_bytes = match response.bytes().await {
@@ -725,7 +725,7 @@ async fn handle_stream(
 ) -> Response {
     let response = match provider.call_api_stream(&request_body).await {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, Some(&request_body)),
     };
 
     let id = format!("chatcmpl-{}", Uuid::new_v4().to_string().replace('-', ""));
@@ -1018,7 +1018,13 @@ fn chrono_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn map_provider_error(err: anyhow::Error) -> Response {
+fn format_request_body_for_log(request_body: &str) -> String {
+    serde_json::from_str::<Value>(request_body)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| request_body.to_string())
+}
+
+fn map_provider_error(err: anyhow::Error, request_body: Option<&str>) -> Response {
     let err_str = err.to_string();
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         return (
@@ -1039,6 +1045,14 @@ fn map_provider_error(err: anyhow::Error) -> Response {
             )),
         )
             .into_response();
+    }
+    if err_str.contains("Improperly formed request") {
+        if let Some(request_body) = request_body {
+            tracing::error!(
+                "OpenAI 转换后的 Kiro 请求体（上游判定 Improperly formed request）:\n{}",
+                format_request_body_for_log(request_body)
+            );
+        }
     }
     tracing::error!("Kiro API 调用失败 (openai): {}", err);
     (
