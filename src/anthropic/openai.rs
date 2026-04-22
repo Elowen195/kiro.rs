@@ -332,6 +332,7 @@ pub async fn post_chat_completions(
 fn openai_to_anthropic(req: ChatCompletionsRequest) -> Result<MessagesRequest, String> {
     let mut system_texts = Vec::<String>::new();
     let mut anthropic_msgs = Vec::<AnthropicMessage>::new();
+    let mut tool_call_id_mapper = ToolCallIdMapper::default();
 
     for msg in req.messages {
         match msg.role.as_str() {
@@ -351,14 +352,23 @@ fn openai_to_anthropic(req: ChatCompletionsRequest) -> Result<MessagesRequest, S
             "assistant" => {
                 anthropic_msgs.push(AnthropicMessage {
                     role: "assistant".to_string(),
-                    content: convert_assistant_content(&msg),
+                    content: convert_assistant_content(&msg, &mut tool_call_id_mapper),
                 });
             }
             "tool" => {
                 // 转成 user 的 tool_result block
-                let tool_call_id = msg
+                let original_tool_call_id = msg
                     .tool_call_id
                     .ok_or_else(|| "tool 角色的消息必须提供 tool_call_id".to_string())?;
+                let tool_call_id = tool_call_id_mapper
+                    .consume(&original_tool_call_id)
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            original_tool_call_id = %original_tool_call_id,
+                            "tool 结果未匹配到前序 assistant.tool_calls，回退使用原始 id"
+                        );
+                        original_tool_call_id
+                    });
                 let content_text = string_content(&msg.content).unwrap_or_default();
                 anthropic_msgs.push(AnthropicMessage {
                     role: "user".to_string(),
@@ -494,7 +504,32 @@ fn convert_user_content(v: &Value) -> Value {
     }
 }
 
-fn convert_assistant_content(msg: &ChatMessage) -> Value {
+#[derive(Default)]
+struct ToolCallIdMapper {
+    pending: std::collections::HashMap<String, std::collections::VecDeque<String>>,
+}
+
+impl ToolCallIdMapper {
+    fn register(&mut self, original_id: &str) -> String {
+        let mapped_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+        self.pending
+            .entry(original_id.to_string())
+            .or_default()
+            .push_back(mapped_id.clone());
+        mapped_id
+    }
+
+    fn consume(&mut self, original_id: &str) -> Option<String> {
+        let queue = self.pending.get_mut(original_id)?;
+        let mapped = queue.pop_front();
+        if queue.is_empty() {
+            self.pending.remove(original_id);
+        }
+        mapped
+    }
+}
+
+fn convert_assistant_content(msg: &ChatMessage, tool_call_id_mapper: &mut ToolCallIdMapper) -> Value {
     let mut blocks = Vec::<Value>::new();
     if let Some(text) = string_content(&msg.content) {
         if !text.is_empty() {
@@ -503,6 +538,7 @@ fn convert_assistant_content(msg: &ChatMessage) -> Value {
     }
     if let Some(tool_calls) = &msg.tool_calls {
         for tc in tool_calls {
+            let mapped_id = tool_call_id_mapper.register(&tc.id);
             let input: Value = if tc.function.arguments.trim().is_empty() {
                 json!({})
             } else {
@@ -510,7 +546,7 @@ fn convert_assistant_content(msg: &ChatMessage) -> Value {
             };
             blocks.push(json!({
                 "type":"tool_use",
-                "id": tc.id,
+                "id": mapped_id,
                 "name": tc.function.name,
                 "input": input,
             }));
@@ -1013,4 +1049,119 @@ fn map_provider_error(err: anyhow::Error) -> Response {
         )),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract_single_tool_use_id(message: &AnthropicMessage) -> String {
+        message
+            .content
+            .as_array()
+            .and_then(|blocks| blocks.iter().find(|block| block.get("type") == Some(&Value::String("tool_use".to_string()))))
+            .and_then(|block| block.get("id"))
+            .and_then(|id| id.as_str())
+            .expect("assistant message should contain tool_use id")
+            .to_string()
+    }
+
+    fn extract_single_tool_result_id(message: &AnthropicMessage) -> String {
+        message
+            .content
+            .as_array()
+            .and_then(|blocks| blocks.iter().find(|block| block.get("type") == Some(&Value::String("tool_result".to_string()))))
+            .and_then(|block| block.get("tool_use_id"))
+            .and_then(|id| id.as_str())
+            .expect("user message should contain tool_result id")
+            .to_string()
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_remaps_reused_tool_call_ids_per_round() {
+        let req = ChatCompletionsRequest {
+            model: "glm-5".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Value::String("first".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Value::Null,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: "call_shared".to_string(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: "glob".to_string(),
+                            arguments: r#"{"pattern":"**/package.json"}"#.to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: Value::String("result-1".to_string()),
+                    tool_calls: None,
+                    tool_call_id: Some("call_shared".to_string()),
+                    name: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Value::Null,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: "call_shared".to_string(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: "grep".to_string(),
+                            arguments: r#"{"pattern":"TODO"}"#.to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: Value::String("result-2".to_string()),
+                    tool_calls: None,
+                    tool_call_id: Some("call_shared".to_string()),
+                    name: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Value::String("continue".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            stream: true,
+            max_tokens: Some(128),
+            max_completion_tokens: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+        };
+
+        let payload = openai_to_anthropic(req).expect("conversion should succeed");
+
+        assert_eq!(payload.messages.len(), 6);
+
+        let first_tool_use_id = extract_single_tool_use_id(&payload.messages[1]);
+        let first_tool_result_id = extract_single_tool_result_id(&payload.messages[2]);
+        let second_tool_use_id = extract_single_tool_use_id(&payload.messages[3]);
+        let second_tool_result_id = extract_single_tool_result_id(&payload.messages[4]);
+
+        assert_eq!(first_tool_use_id, first_tool_result_id);
+        assert_eq!(second_tool_use_id, second_tool_result_id);
+        assert_ne!(first_tool_use_id, second_tool_use_id);
+        assert!(first_tool_use_id.starts_with("toolu_"));
+        assert!(second_tool_use_id.starts_with("toolu_"));
+    }
 }
