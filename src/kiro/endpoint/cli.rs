@@ -4,15 +4,14 @@
 //! - API: `https://q.{api_region}.amazonaws.com/`（通过 `x-amz-target` header 区分动作）
 //! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
 //!
-//! 与 IDE 端点的差异（均源自真实抓包 extracted-chat-requests.log）:
+//! 与 IDE 端点的差异（以当前 Amazon Q CLI 公开源码行为为准）:
 //! - URL 统一为 `/`，不带 `/generateAssistantResponse` 路径
 //! - content-type: `application/x-amz-json-1.0`
 //! - x-amz-target: `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
 //! - user-agent: `aws-sdk-rust/... app/AmazonQ-For-CLI`
-//! - body: 不携带 `modelId`/`agentContinuationId`/`chatTriggerType`/`agentTaskType`/`profileArn`；
-//!         `currentMessage.userInputMessage` 不携带 `origin`；
-//!         所有 `userInputMessageContext` 必须带 `envState`；
-//!         history 中 `userInputMessage` 的 `origin` 必须为 `KIRO_CLI`。
+//! - body: 保留 `profileArn` / `modelId` / `agentContinuationId` / `chatTriggerType` / `agentTaskType`；
+//!         所有 user message 的 `origin` 统一为 `KIRO_CLI`；
+//!         所有 `userInputMessageContext` 必须带 `envState`。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -28,6 +27,8 @@ const SDK_VERSION: &str = "aws-sdk-rust/1.3.14";
 const STREAMING_API_VERSION: &str = "api/codewhispererstreaming/0.1.14474";
 /// codewhispererruntime 服务版本（用于 ListAvailableModels 等非流式 API）
 const RUNTIME_API_VERSION: &str = "api/codewhispererruntime/0.1.14474";
+/// CLI userInputMessage.origin
+const CLI_MESSAGE_ORIGIN: &str = "KIRO_CLI";
 
 /// ListAvailableModels 上游规格
 pub struct ListModelsSpec {
@@ -104,14 +105,31 @@ impl CliEndpoint {
 
     /// 针对 ListAvailableModels API 的请求规格
     pub fn list_models_spec(&self, ctx: &RequestContext<'_>) -> ListModelsSpec {
-        let url = format!(
-            "https://q.{}.amazonaws.com/?origin=KIRO_CLI",
-            self.api_region(ctx)
-        );
+        let url = if let Some(profile_arn) = ctx.credentials.profile_arn.as_deref() {
+            format!(
+                "https://q.{}.amazonaws.com/?origin=KIRO_CLI&profileArn={}",
+                self.api_region(ctx),
+                urlencoding::encode(profile_arn)
+            )
+        } else {
+            format!(
+                "https://q.{}.amazonaws.com/?origin=KIRO_CLI",
+                self.api_region(ctx)
+            )
+        };
+        let body = if let Some(profile_arn) = ctx.credentials.profile_arn.as_deref() {
+            serde_json::json!({
+                "origin": "KIRO_CLI",
+                "profileArn": profile_arn,
+            })
+            .to_string()
+        } else {
+            r#"{"origin":"KIRO_CLI"}"#.to_string()
+        };
         ListModelsSpec {
             url,
             x_amz_target: "AmazonCodeWhispererService.ListAvailableModels",
-            body: r#"{"origin":"KIRO_CLI"}"#.to_string(),
+            body,
         }
     }
 
@@ -201,37 +219,27 @@ impl KiroEndpoint for CliEndpoint {
         req
     }
 
-    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        adapt_body_for_cli(body)
+    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        adapt_body_for_cli(body, &ctx.credentials.profile_arn)
     }
 }
 
-/// 把 IDE 格式的 Kiro 请求体改造为 CLI 格式（不修改 converter.rs）
+/// 把通用 Kiro 请求体改造为当前 CLI 端点形状（不修改 converter.rs）
 ///
-/// 操作（基于 kiroCLI 真实抓包）：
-/// - 删除 `conversationState` 顶层：`agentContinuationId` / `agentTaskType` / `chatTriggerType`
-/// - 删除根对象 `profileArn`（IDE 端点的 transform 才注入）
-/// - `currentMessage.userInputMessage`：删除 `modelId` 和 `origin`，注入 `envState`
-/// - `history[].userInputMessage`：删除 `modelId`，强制 `origin = "KIRO_CLI"`，注入 `envState`
-fn adapt_body_for_cli(body: &str) -> String {
+/// 操作（对齐当前 Amazon Q CLI 行为）：
+/// - 根对象保留/注入 `profileArn`
+/// - `currentMessage.userInputMessage`：保留 `modelId`，强制 `origin = "KIRO_CLI"`，注入 `envState`
+/// - `history[].userInputMessage`：保留 `modelId`，强制 `origin = "KIRO_CLI"`，注入 `envState`
+fn adapt_body_for_cli(body: &str, profile_arn: &Option<String>) -> String {
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
         return body.to_string();
     };
 
-    // 根对象：不要 profileArn（CLI 端点不发）
-    if let serde_json::Value::Object(ref mut root) = json {
-        root.remove("profileArn");
-    }
+    inject_profile_arn(&mut json, profile_arn);
 
     let Some(state) = json.get_mut("conversationState") else {
         return serde_json::to_string(&json).unwrap_or_else(|_| body.to_string());
     };
-
-    if let serde_json::Value::Object(state_obj) = state {
-        state_obj.remove("agentContinuationId");
-        state_obj.remove("agentTaskType");
-        state_obj.remove("chatTriggerType");
-    }
 
     // currentMessage.userInputMessage
     if let Some(current) = state
@@ -239,23 +247,24 @@ fn adapt_body_for_cli(body: &str) -> String {
         .and_then(|v| v.get_mut("userInputMessage"))
     {
         if let serde_json::Value::Object(obj) = current {
-            obj.remove("modelId");
-            obj.remove("origin");
+            obj.insert(
+                "origin".to_string(),
+                serde_json::Value::String(CLI_MESSAGE_ORIGIN.to_string()),
+            );
             inject_env_state(obj);
         }
     }
 
-    // history[]: 为每个 user 消息做同样处理（但保留 origin=KIRO_CLI）
+    // history[]: 为每个 user 消息做同样处理
     if let Some(history) = state.get_mut("history").and_then(|v| v.as_array_mut()) {
         for msg in history.iter_mut() {
             let Some(user) = msg.get_mut("userInputMessage") else {
                 continue;
             };
             if let serde_json::Value::Object(obj) = user {
-                obj.remove("modelId");
                 obj.insert(
                     "origin".to_string(),
-                    serde_json::Value::String("KIRO_CLI".to_string()),
+                    serde_json::Value::String(CLI_MESSAGE_ORIGIN.to_string()),
                 );
                 inject_env_state(obj);
             }
@@ -263,6 +272,19 @@ fn adapt_body_for_cli(body: &str) -> String {
     }
 
     serde_json::to_string(&json).unwrap_or_else(|_| body.to_string())
+}
+
+fn inject_profile_arn(json: &mut serde_json::Value, profile_arn: &Option<String>) {
+    let Some(profile_arn) = profile_arn.as_ref() else {
+        return;
+    };
+
+    if let serde_json::Value::Object(root) = json {
+        root.insert(
+            "profileArn".to_string(),
+            serde_json::Value::String(profile_arn.clone()),
+        );
+    }
 }
 
 /// 在 userInputMessage 对象里确保 `userInputMessageContext.envState` 存在
@@ -282,7 +304,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_adapt_body_strips_ide_fields() {
+    fn test_adapt_body_preserves_fields_and_normalizes_current_origin() {
         let input = r#"{
             "profileArn": "arn:aws:codewhisperer:us-east-1:123:profile/X",
             "conversationState": {
@@ -300,20 +322,23 @@ mod tests {
                 "history": []
             }
         }"#;
-        let out = adapt_body_for_cli(input);
+        let out = adapt_body_for_cli(
+            input,
+            &Some("arn:aws:codewhisperer:us-east-1:123:profile/X".to_string()),
+        );
         let json: serde_json::Value = serde_json::from_str(&out).unwrap();
 
-        // 根对象 profileArn 被移除
-        assert!(json.get("profileArn").is_none());
-        // 顶层字段被移除
+        assert_eq!(
+            json["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/X"
+        );
         let state = &json["conversationState"];
-        assert!(state.get("agentContinuationId").is_none());
-        assert!(state.get("agentTaskType").is_none());
-        assert!(state.get("chatTriggerType").is_none());
-        // currentMessage 的 modelId/origin 被移除
+        assert_eq!(state["agentContinuationId"], "abc");
+        assert_eq!(state["agentTaskType"], "vibe");
+        assert_eq!(state["chatTriggerType"], "MANUAL");
         let cur = &state["currentMessage"]["userInputMessage"];
-        assert!(cur.get("modelId").is_none());
-        assert!(cur.get("origin").is_none());
+        assert_eq!(cur["modelId"], "claude-sonnet-4.5");
+        assert_eq!(cur["origin"], "KIRO_CLI");
         // envState 被注入
         assert!(cur["userInputMessageContext"]["envState"].is_object());
         assert_eq!(state["conversationId"], "c1");
@@ -344,11 +369,14 @@ mod tests {
                 ]
             }
         }"#;
-        let out = adapt_body_for_cli(input);
+        let out = adapt_body_for_cli(input, &None);
         let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let cur = &json["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(cur["origin"], "KIRO_CLI");
+        assert_eq!(cur["modelId"], "claude-sonnet-4.5");
         let hist_user = &json["conversationState"]["history"][0]["userInputMessage"];
         assert_eq!(hist_user["origin"], "KIRO_CLI");
-        assert!(hist_user.get("modelId").is_none());
+        assert_eq!(hist_user["modelId"], "claude-sonnet-4.5");
         assert!(hist_user["userInputMessageContext"]["envState"].is_object());
         // assistant 消息不被改动
         assert_eq!(
@@ -360,7 +388,7 @@ mod tests {
     #[test]
     fn test_adapt_body_invalid_json_passthrough() {
         let input = "not-valid-json";
-        let out = adapt_body_for_cli(input);
+        let out = adapt_body_for_cli(input, &None);
         assert_eq!(out, "not-valid-json");
     }
 
@@ -370,5 +398,29 @@ mod tests {
         assert!(env.is_object());
         assert!(env["operatingSystem"].is_string());
         assert!(env["currentWorkingDirectory"].is_string());
+    }
+
+    #[test]
+    fn test_list_models_spec_includes_profile_arn_when_available() {
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::model::config::Config;
+
+        let cli = CliEndpoint::new();
+        let config = Config::default();
+        let credentials = KiroCredentials {
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/X".to_string()),
+            ..Default::default()
+        };
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let spec = cli.list_models_spec(&ctx);
+        assert!(spec.url.contains("origin=KIRO_CLI"));
+        assert!(spec.url.contains("profileArn="));
+        assert!(spec.body.contains("\"profileArn\""));
     }
 }

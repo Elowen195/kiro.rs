@@ -36,6 +36,7 @@ use crate::token;
 use super::converter::{ConversionError, convert_request, get_context_window_size};
 use super::handlers::override_thinking_from_model_name;
 use super::middleware::AppState;
+use super::models::fetch_upstream_models;
 use super::types::{
     ErrorResponse, Message as AnthropicMessage, MessagesRequest, SystemMessage, Thinking,
     Tool as AnthropicTool,
@@ -171,7 +172,62 @@ pub struct ChatUsage {
     pub total_tokens: i32,
 }
 
+#[derive(Debug, Serialize)]
+pub struct OpenAIModelsResponse {
+    pub object: String,
+    pub data: Vec<OpenAIModel>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenAIModel {
+    pub id: String,
+    pub object: &'static str,
+    pub created: i64,
+    pub owned_by: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_input_types: Vec<String>,
+    pub max_input_tokens: i32,
+    pub max_output_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_multiplier: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_unit: Option<String>,
+}
+
 // === Handler ===
+
+/// GET /v1/models
+pub async fn get_models(State(state): State<AppState>) -> Response {
+    tracing::info!("Received GET /v1/models request");
+
+    let models = match fetch_upstream_models(&state).await {
+        Ok(models) => models,
+        Err(response) => return response,
+    };
+
+    let data = models
+        .into_iter()
+        .map(|model| OpenAIModel {
+            id: model.id,
+            object: "model",
+            created: 0,
+            owned_by: model.owned_by,
+            display_name: model.display_name,
+            supported_input_types: model.supported_input_types,
+            max_input_tokens: model.max_input_tokens,
+            max_output_tokens: model.max_output_tokens,
+            rate_multiplier: model.rate_multiplier,
+            rate_unit: model.rate_unit,
+        })
+        .collect();
+
+    Json(OpenAIModelsResponse {
+        object: "list".to_string(),
+        data,
+    })
+    .into_response()
+}
 
 /// POST /v1/chat/completions
 pub async fn post_chat_completions(
@@ -300,9 +356,9 @@ fn openai_to_anthropic(req: ChatCompletionsRequest) -> Result<MessagesRequest, S
             }
             "tool" => {
                 // 转成 user 的 tool_result block
-                let tool_call_id = msg.tool_call_id.ok_or_else(|| {
-                    "tool 角色的消息必须提供 tool_call_id".to_string()
-                })?;
+                let tool_call_id = msg
+                    .tool_call_id
+                    .ok_or_else(|| "tool 角色的消息必须提供 tool_call_id".to_string())?;
                 let content_text = string_content(&msg.content).unwrap_or_default();
                 anthropic_msgs.push(AnthropicMessage {
                     role: "user".to_string(),
@@ -352,10 +408,7 @@ fn openai_to_anthropic(req: ChatCompletionsRequest) -> Result<MessagesRequest, S
         _ => None,
     });
 
-    let max_tokens = req
-        .max_tokens
-        .or(req.max_completion_tokens)
-        .unwrap_or(4096);
+    let max_tokens = req.max_tokens.or(req.max_completion_tokens).unwrap_or(4096);
 
     Ok(MessagesRequest {
         model: req.model,
@@ -381,7 +434,11 @@ fn string_content(v: &Value) -> Option<String> {
                     parts.push(t.to_string());
                 }
             }
-            if parts.is_empty() { None } else { Some(parts.join("\n")) }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
         }
         Value::Null => None,
         other => Some(other.to_string()),
@@ -410,11 +467,8 @@ fn convert_user_content(v: &Value) -> Value {
                             .unwrap_or("");
                         if let Some(base64) = url.strip_prefix("data:") {
                             if let Some((meta, data)) = base64.split_once(',') {
-                                let media_type = meta
-                                    .split(';')
-                                    .next()
-                                    .unwrap_or("image/png")
-                                    .to_string();
+                                let media_type =
+                                    meta.split(';').next().unwrap_or("image/png").to_string();
                                 blocks.push(json!({
                                     "type":"image",
                                     "source":{
@@ -530,14 +584,16 @@ async fn handle_non_stream(
             Event::AssistantResponse(resp) => text.push_str(&resp.content),
             Event::ToolUse(tu) => {
                 has_tool_use = true;
-                let entry = tool_buffers.entry(tu.tool_use_id.clone()).or_insert_with(
-                    || {
+                let entry = tool_buffers
+                    .entry(tu.tool_use_id.clone())
+                    .or_insert_with(|| {
                         tool_order.push(tu.tool_use_id.clone());
-                        let original_name =
-                            tool_name_map.get(&tu.name).cloned().unwrap_or(tu.name.clone());
+                        let original_name = tool_name_map
+                            .get(&tu.name)
+                            .cloned()
+                            .unwrap_or(tu.name.clone());
                         (original_name, String::new(), tu.tool_use_id.clone())
-                    },
-                );
+                    });
                 entry.1.push_str(&tu.input);
             }
             Event::ContextUsage(cu) => {

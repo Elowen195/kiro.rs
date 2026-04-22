@@ -4,14 +4,14 @@
 //!
 //! # 支持的端点
 //!
-//! ## 标准端点 (/v1)
+//! ## OpenAI 兼容端点 (/v1)
 //! - `GET /v1/models` - 获取可用模型列表
-//! - `POST /v1/messages` - 创建消息（对话）
-//! - `POST /v1/messages/count_tokens` - 计算 token 数量
+//! - `POST /v1/chat/completions` - OpenAI Chat Completions
 //!
-//! ## Claude Code 兼容端点 (/cc/v1)
+//! ## Anthropic / Claude Code 兼容端点 (/cc/v1)
+//! - `GET /cc/v1/models` - 获取可用模型列表
 //! - `POST /cc/v1/messages` - 创建消息（流式响应会等待 contextUsageEvent 后再发送 message_start，确保 input_tokens 准确）
-//! - `POST /cc/v1/messages/count_tokens` - 计算 token 数量（与 /v1 相同）
+//! - `POST /cc/v1/messages/count_tokens` - 计算 token 数量
 //!
 //! # 使用示例
 //! ```rust,ignore
@@ -24,8 +24,8 @@
 
 mod converter;
 mod handlers;
-mod local_cli;
 mod middleware;
+mod models;
 mod openai;
 mod router;
 mod stream;

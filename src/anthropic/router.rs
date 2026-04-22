@@ -10,9 +10,9 @@ use axum::{
 use crate::kiro::provider::KiroProvider;
 
 use super::{
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    handlers::{count_tokens, get_models as get_cc_models, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
-    openai::post_chat_completions,
+    openai::{get_models as get_openai_models, post_chat_completions},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -21,9 +21,8 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// 创建 Anthropic API 路由
 ///
 /// # 端点
-/// - `GET /v1/models` - 获取可用模型列表
-/// - `POST /v1/messages` - 创建消息（对话）
-/// - `POST /v1/messages/count_tokens` - 计算 token 数量
+/// - `GET /v1/models` - 获取可用模型列表（OpenAI 兼容）
+/// - `POST /v1/chat/completions` - OpenAI Chat Completions
 ///
 /// # 认证
 /// 所有 `/v1` 路径需要 API Key 认证，支持：
@@ -47,18 +46,16 @@ pub fn create_router_with_provider(
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
-        .route("/models", get(get_models))
-        .route("/messages", post(post_messages))
-        .route("/messages/count_tokens", post(count_tokens))
+        .route("/models", get(get_openai_models))
         .route("/chat/completions", post(post_chat_completions))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
 
-    // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
-    // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
+    // 需要认证的 /cc/v1 路由（Anthropic / Claude Code 兼容端点）
     let cc_v1_routes = Router::new()
+        .route("/models", get(get_cc_models))
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
