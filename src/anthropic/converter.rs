@@ -547,16 +547,23 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
-    let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    // 5. 处理末尾连续的 user 消息作为当前轮次，避免多条 tool_result 被拆散
+    let current_turn_start = find_current_user_turn_start(messages);
+    let current_turn_messages: Vec<_> = messages[current_turn_start..].iter().collect();
+    let (text_content, images, tool_results) = collect_user_message_parts(&current_turn_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let mut history = build_history(
+        req,
+        messages,
+        current_turn_start,
+        &model_id,
+        &mut tool_name_map,
+    )?;
     let use_cli_agent_envelope = should_apply_cli_agent_envelope(&model_id);
 
     if use_cli_agent_envelope {
@@ -1029,6 +1036,7 @@ fn has_thinking_tags(content: &str) -> bool {
 fn build_history(
     req: &MessagesRequest,
     messages: &[super::types::Message],
+    current_turn_start: usize,
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<Vec<Message>, ConversionError> {
@@ -1077,9 +1085,8 @@ fn build_history(
     }
 
     // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
-    let history_end_index = messages.len().saturating_sub(1);
+    // 末尾连续的 user 消息作为 currentMessage，不加入历史。
+    let history_end_index = current_turn_start;
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
@@ -1132,20 +1139,8 @@ fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
 ) -> Result<HistoryUserMessage, ConversionError> {
-    let mut content_parts = Vec::new();
-    let mut all_images = Vec::new();
-    let mut all_tool_results = Vec::new();
+    let (content, all_images, all_tool_results) = collect_user_message_parts(messages)?;
 
-    for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
-        if !text.is_empty() {
-            content_parts.push(text);
-        }
-        all_images.extend(images);
-        all_tool_results.extend(tool_results);
-    }
-
-    let content = content_parts.join("\n");
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
@@ -1162,6 +1157,35 @@ fn merge_user_messages(
     Ok(HistoryUserMessage {
         user_input_message: user_msg,
     })
+}
+
+fn collect_user_message_parts(
+    messages: &[&super::types::Message],
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    let mut content_parts = Vec::new();
+    let mut all_images = Vec::new();
+    let mut all_tool_results = Vec::new();
+
+    for msg in messages {
+        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        if !text.is_empty() {
+            content_parts.push(text);
+        }
+        all_images.extend(images);
+        all_tool_results.extend(tool_results);
+    }
+
+    Ok((content_parts.join("\n"), all_images, all_tool_results))
+}
+
+fn find_current_user_turn_start(messages: &[super::types::Message]) -> usize {
+    let mut start = messages.len().saturating_sub(1);
+
+    while start > 0 && messages[start - 1].role == "user" {
+        start -= 1;
+    }
+
+    start
 }
 
 /// 转换 assistant 消息
@@ -1851,6 +1875,75 @@ mod tests {
                 .model_id,
             "glm-5"
         );
+    }
+
+    #[test]
+    fn test_convert_request_keeps_trailing_user_tool_results_in_current_turn() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("检查前端项目"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "toolu_read_pkg", "name": "Read", "input": {"file_path": "/workspace/package.json"}},
+                        {"type": "tool_use", "id": "toolu_glob_src", "name": "Glob", "input": {"pattern": "**/*.tsx"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_read_pkg", "content": "{\"name\":\"demo\"}"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_glob_src", "content": "[\"src/App.tsx\"]"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("conversion should succeed");
+        let state = result.conversation_state;
+
+        assert_eq!(state.history.len(), 2, "末尾连续 user 不应被拆进历史");
+
+        let current_tool_results = &state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(current_tool_results.len(), 2);
+        assert_eq!(current_tool_results[0].tool_use_id, "toolu_read_pkg");
+        assert_eq!(current_tool_results[1].tool_use_id, "toolu_glob_src");
+
+        let last_history = state.history.last().expect("history should not be empty");
+        match last_history {
+            Message::Assistant(assistant_msg) => {
+                let tool_uses = assistant_msg
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .expect("assistant should keep tool uses");
+                assert_eq!(tool_uses.len(), 2);
+            }
+            Message::User(_) => panic!("history should end with assistant tool_use turn"),
+        }
     }
 
     #[test]
