@@ -16,7 +16,7 @@ use crate::kiro::endpoint::cli::{CLI_ENDPOINT_NAME, CliEndpoint};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, TransientAvoidanceExhaustedError};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -336,6 +336,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut transient_avoided_ids: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -343,9 +344,29 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match if transient_avoided_ids.is_empty() {
+                self.token_manager.acquire_context(model.as_deref()).await
+            } else {
+                self.token_manager
+                    .acquire_context_excluding(model.as_deref(), &transient_avoided_ids)
+                    .await
+            } {
                 Ok(c) => c,
                 Err(e) => {
+                    if e.downcast_ref::<TransientAvoidanceExhaustedError>()
+                        .is_some()
+                    {
+                        tracing::info!(
+                            avoided_credentials = ?transient_avoided_ids,
+                            "本轮瞬态错误避让已覆盖所有候选凭据，清空避让列表后继续重试"
+                        );
+                        transient_avoided_ids.clear();
+                        last_error = Some(e);
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
+                        continue;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -391,6 +412,7 @@ impl KiroProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
+                        credential_id = ctx.id,
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
                         max_retries,
@@ -454,6 +476,7 @@ impl KiroProvider {
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
                 tracing::warn!(
+                    credential_id = ctx.id,
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -496,10 +519,13 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            // 429/408/5xx - 瞬态上游错误：不累计失败、不禁用，
+            // 但在当前请求的后续重试中临时避让这张凭据，减少连续撞同一卡的概率
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                transient_avoided_ids.insert(ctx.id);
                 tracing::warn!(
+                    credential_id = ctx.id,
+                    avoided_credentials = ?transient_avoided_ids,
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
