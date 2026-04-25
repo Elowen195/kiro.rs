@@ -6,8 +6,15 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
+use reqwest::header::HeaderMap;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -25,6 +32,13 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+const UPSTREAM_DEBUG_ENV: &str = "KIRO_UPSTREAM_DEBUG";
+const UPSTREAM_DEBUG_FILE_ENV: &str = "KIRO_UPSTREAM_DEBUG_FILE";
+const DEFAULT_UPSTREAM_DEBUG_FILE: &str = "kiro-upstream-debug.ndjson";
+
+static UPSTREAM_DEBUG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static UPSTREAM_DEBUG_FILE_LOCK: StdMutex<()> = StdMutex::new(());
+static UPSTREAM_DEBUG_PATH_ANNOUNCED: OnceLock<()> = OnceLock::new();
 
 /// Kiro API Provider
 ///
@@ -44,6 +58,187 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+}
+
+fn is_truthy_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn resolve_upstream_debug_path(
+    enabled: Option<&str>,
+    file: Option<&str>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    let cwd = cwd.unwrap_or_else(|| Path::new("."));
+
+    if let Some(file) = file.map(str::trim).filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(file);
+        return Some(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        });
+    }
+
+    if enabled.is_some_and(is_truthy_env) {
+        return Some(cwd.join(DEFAULT_UPSTREAM_DEBUG_FILE));
+    }
+
+    None
+}
+
+fn upstream_debug_path() -> Option<PathBuf> {
+    UPSTREAM_DEBUG_PATH
+        .get_or_init(|| {
+            let cwd = env::current_dir().ok();
+            resolve_upstream_debug_path(
+                env::var(UPSTREAM_DEBUG_ENV).ok().as_deref(),
+                env::var(UPSTREAM_DEBUG_FILE_ENV).ok().as_deref(),
+                cwd.as_deref(),
+            )
+        })
+        .clone()
+}
+
+fn upstream_debug_enabled() -> bool {
+    upstream_debug_path().is_some()
+}
+
+fn sorted_credential_ids(ids: &HashSet<u64>) -> Vec<u64> {
+    let mut sorted: Vec<u64> = ids.iter().copied().collect();
+    sorted.sort_unstable();
+    sorted
+}
+
+fn serialize_headers(headers: &HeaderMap) -> Value {
+    let mut serialized = serde_json::Map::new();
+    for (name, value) in headers {
+        serialized.insert(
+            name.as_str().to_string(),
+            Value::String(value.to_str().unwrap_or("<non-utf8>").to_string()),
+        );
+    }
+    Value::Object(serialized)
+}
+
+fn append_upstream_debug_record(record: Value) {
+    let Some(path) = upstream_debug_path() else {
+        return;
+    };
+
+    if UPSTREAM_DEBUG_PATH_ANNOUNCED.set(()).is_ok() {
+        tracing::warn!(
+            path = %path.display(),
+            "已启用上游诊断落盘；失败请求将追加写入该文件"
+        );
+    }
+
+    let _guard = match UPSTREAM_DEBUG_FILE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Err(err) = fs::create_dir_all(parent) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "创建上游诊断目录失败"
+            );
+            return;
+        }
+    }
+
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "打开上游诊断文件失败"
+            );
+            return;
+        }
+    };
+
+    let line = match serde_json::to_string(&record) {
+        Ok(line) => line,
+        Err(err) => {
+            tracing::warn!(error = %err, "序列化上游诊断记录失败");
+            return;
+        }
+    };
+
+    if let Err(err) = writeln!(file, "{}", line) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "写入上游诊断文件失败"
+        );
+    }
+}
+
+struct UpstreamDebugAttempt<'a> {
+    api_type: &'a str,
+    attempt: usize,
+    max_retries: usize,
+    credential_id: u64,
+    endpoint_name: &'a str,
+    url: &'a str,
+    is_stream: bool,
+    model: Option<&'a str>,
+    avoided_credentials: &'a HashSet<u64>,
+    request_body: Option<&'a str>,
+}
+
+fn dump_upstream_send_error(attempt: &UpstreamDebugAttempt<'_>, error: &str) {
+    append_upstream_debug_record(json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "kind": "request_send_error",
+        "api_type": attempt.api_type,
+        "attempt": attempt.attempt,
+        "max_retries": attempt.max_retries,
+        "credential_id": attempt.credential_id,
+        "endpoint": attempt.endpoint_name,
+        "url": attempt.url,
+        "is_stream": attempt.is_stream,
+        "model": attempt.model,
+        "avoided_credentials": sorted_credential_ids(attempt.avoided_credentials),
+        "request_body_bytes": attempt.request_body.map(|body| body.len()),
+        "request_body": attempt.request_body,
+        "error": error,
+    }));
+}
+
+fn dump_upstream_response_error(
+    attempt: &UpstreamDebugAttempt<'_>,
+    classification: &str,
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    response_body: &str,
+) {
+    append_upstream_debug_record(json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "kind": "response_error",
+        "classification": classification,
+        "api_type": attempt.api_type,
+        "attempt": attempt.attempt,
+        "max_retries": attempt.max_retries,
+        "credential_id": attempt.credential_id,
+        "endpoint": attempt.endpoint_name,
+        "url": attempt.url,
+        "is_stream": attempt.is_stream,
+        "model": attempt.model,
+        "avoided_credentials": sorted_credential_ids(attempt.avoided_credentials),
+        "request_body_bytes": attempt.request_body.map(|body| body.len()),
+        "request_body": attempt.request_body,
+        "response_status": status.as_u16(),
+        "response_headers": serialize_headers(headers),
+        "response_body": response_body,
+    }));
 }
 
 impl KiroProvider {
@@ -393,6 +588,7 @@ impl KiroProvider {
 
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
+            let debug_request_body = upstream_debug_enabled().then(|| body.clone());
             tracing::debug!(
                 endpoint = endpoint.name(),
                 credential_id = ctx.id,
@@ -411,6 +607,21 @@ impl KiroProvider {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    dump_upstream_send_error(
+                        &UpstreamDebugAttempt {
+                            api_type,
+                            attempt: attempt + 1,
+                            max_retries,
+                            credential_id: ctx.id,
+                            endpoint_name: endpoint.name(),
+                            url: &url,
+                            is_stream,
+                            model: model.as_deref(),
+                            avoided_credentials: &transient_avoided_ids,
+                            request_body: debug_request_body.as_deref(),
+                        },
+                        &e.to_string(),
+                    );
                     tracing::warn!(
                         credential_id = ctx.id,
                         "API 请求发送失败（尝试 {}/{}）: {}",
@@ -429,6 +640,7 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let response_headers = response.headers().clone();
 
             // 成功响应
             if status.is_success() {
@@ -441,6 +653,24 @@ impl KiroProvider {
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                dump_upstream_response_error(
+                    &UpstreamDebugAttempt {
+                        api_type,
+                        attempt: attempt + 1,
+                        max_retries,
+                        credential_id: ctx.id,
+                        endpoint_name: endpoint.name(),
+                        url: &url,
+                        is_stream,
+                        model: model.as_deref(),
+                        avoided_credentials: &transient_avoided_ids,
+                        request_body: debug_request_body.as_deref(),
+                    },
+                    "quota_exhausted",
+                    status,
+                    &response_headers,
+                    &body,
+                );
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -470,11 +700,47 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                dump_upstream_response_error(
+                    &UpstreamDebugAttempt {
+                        api_type,
+                        attempt: attempt + 1,
+                        max_retries,
+                        credential_id: ctx.id,
+                        endpoint_name: endpoint.name(),
+                        url: &url,
+                        is_stream,
+                        model: model.as_deref(),
+                        avoided_credentials: &transient_avoided_ids,
+                        request_body: debug_request_body.as_deref(),
+                    },
+                    "bad_request",
+                    status,
+                    &response_headers,
+                    &body,
+                );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                dump_upstream_response_error(
+                    &UpstreamDebugAttempt {
+                        api_type,
+                        attempt: attempt + 1,
+                        max_retries,
+                        credential_id: ctx.id,
+                        endpoint_name: endpoint.name(),
+                        url: &url,
+                        is_stream,
+                        model: model.as_deref(),
+                        avoided_credentials: &transient_avoided_ids,
+                        request_body: debug_request_body.as_deref(),
+                    },
+                    "credential_error",
+                    status,
+                    &response_headers,
+                    &body,
+                );
                 tracing::warn!(
                     credential_id = ctx.id,
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
@@ -523,9 +789,27 @@ impl KiroProvider {
             // 但在当前请求的后续重试中临时避让这张凭据，减少连续撞同一卡的概率
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 transient_avoided_ids.insert(ctx.id);
+                dump_upstream_response_error(
+                    &UpstreamDebugAttempt {
+                        api_type,
+                        attempt: attempt + 1,
+                        max_retries,
+                        credential_id: ctx.id,
+                        endpoint_name: endpoint.name(),
+                        url: &url,
+                        is_stream,
+                        model: model.as_deref(),
+                        avoided_credentials: &transient_avoided_ids,
+                        request_body: debug_request_body.as_deref(),
+                    },
+                    "transient_upstream_error",
+                    status,
+                    &response_headers,
+                    &body,
+                );
                 tracing::warn!(
                     credential_id = ctx.id,
-                    avoided_credentials = ?transient_avoided_ids,
+                    avoided_credentials = ?sorted_credential_ids(&transient_avoided_ids),
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -546,10 +830,46 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
+                dump_upstream_response_error(
+                    &UpstreamDebugAttempt {
+                        api_type,
+                        attempt: attempt + 1,
+                        max_retries,
+                        credential_id: ctx.id,
+                        endpoint_name: endpoint.name(),
+                        url: &url,
+                        is_stream,
+                        model: model.as_deref(),
+                        avoided_credentials: &transient_avoided_ids,
+                        request_body: debug_request_body.as_deref(),
+                    },
+                    "client_error",
+                    status,
+                    &response_headers,
+                    &body,
+                );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
+            dump_upstream_response_error(
+                &UpstreamDebugAttempt {
+                    api_type,
+                    attempt: attempt + 1,
+                    max_retries,
+                    credential_id: ctx.id,
+                    endpoint_name: endpoint.name(),
+                    url: &url,
+                    is_stream,
+                    model: model.as_deref(),
+                    avoided_credentials: &transient_avoided_ids,
+                    request_body: debug_request_body.as_deref(),
+                },
+                "unknown_error",
+                status,
+                &response_headers,
+                &body,
+            );
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 attempt + 1,
@@ -603,5 +923,38 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_UPSTREAM_DEBUG_FILE, resolve_upstream_debug_path};
+    use std::path::Path;
+
+    #[test]
+    fn test_resolve_upstream_debug_path_disabled() {
+        let path = resolve_upstream_debug_path(Some("0"), None, Some(Path::new("/workspace")));
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_resolve_upstream_debug_path_enabled_with_default_file() {
+        let path = resolve_upstream_debug_path(Some("true"), None, Some(Path::new("/workspace")))
+            .expect("debug path should exist");
+        assert_eq!(
+            path,
+            Path::new("/workspace").join(DEFAULT_UPSTREAM_DEBUG_FILE)
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_debug_path_prefers_explicit_file() {
+        let path = resolve_upstream_debug_path(
+            Some("0"),
+            Some("logs/upstream.ndjson"),
+            Some(Path::new("/workspace")),
+        )
+        .expect("explicit file should enable debug dump");
+        assert_eq!(path, Path::new("/workspace/logs/upstream.ndjson"));
     }
 }
