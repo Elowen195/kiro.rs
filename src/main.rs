@@ -8,6 +8,10 @@ mod model;
 pub mod token;
 
 use std::collections::HashMap;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -17,6 +21,123 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+const DEBUG_LOG_ENV: &str = "KIRO_DEBUG_LOG";
+const DEBUG_LOG_FILE_ENV: &str = "KIRO_DEBUG_LOG_FILE";
+const DEFAULT_DEBUG_LOG_FILE: &str = "kiro-debug.log";
+
+fn is_truthy_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn resolve_debug_log_path(
+    enabled: Option<&str>,
+    file: Option<&str>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    let cwd = cwd.unwrap_or_else(|| Path::new("."));
+
+    if let Some(file) = file.map(str::trim).filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(file);
+        return Some(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        });
+    }
+
+    if enabled.is_some_and(is_truthy_env) {
+        return Some(cwd.join(DEFAULT_DEBUG_LOG_FILE));
+    }
+
+    None
+}
+
+#[derive(Clone)]
+struct FileMakeWriter {
+    path: PathBuf,
+}
+
+struct FileLogWriter {
+    file: std::fs::File,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileMakeWriter {
+    type Writer = FileLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .unwrap_or_else(|err| {
+                panic!("打开调试日志文件失败: {} ({})", self.path.display(), err)
+            });
+        FileLogWriter { file }
+    }
+}
+
+impl Write for FileLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn init_tracing() {
+    let debug_log_path = {
+        let cwd = env::current_dir().ok();
+        resolve_debug_log_path(
+            env::var(DEBUG_LOG_ENV).ok().as_deref(),
+            env::var(DEBUG_LOG_FILE_ENV).ok().as_deref(),
+            cwd.as_deref(),
+        )
+    };
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let default = if debug_log_path.is_some() {
+            "debug"
+        } else {
+            "info"
+        };
+        tracing_subscriber::EnvFilter::new(default)
+    });
+
+    if let Some(path) = debug_log_path {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).unwrap_or_else(|err| {
+                panic!("创建调试日志目录失败: {} ({})", parent.display(), err)
+            });
+        }
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(FileMakeWriter { path: path.clone() }),
+            )
+            .init();
+
+        tracing::warn!(
+            path = %path.display(),
+            "已启用全局调试日志文件输出；所有 tracing 日志将同时写入该文件"
+        );
+        return;
+    }
+
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+}
 
 #[tokio::main]
 async fn main() {
@@ -24,12 +145,7 @@ async fn main() {
     let args = Args::parse();
 
     // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing();
 
     // 加载配置
     let config_path = args
@@ -217,4 +333,34 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_DEBUG_LOG_FILE, resolve_debug_log_path};
+    use std::path::Path;
+
+    #[test]
+    fn test_resolve_debug_log_path_disabled() {
+        let path = resolve_debug_log_path(Some("0"), None, Some(Path::new("/workspace")));
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_resolve_debug_log_path_uses_default_file() {
+        let path = resolve_debug_log_path(Some("true"), None, Some(Path::new("/workspace")))
+            .expect("debug path should exist");
+        assert_eq!(path, Path::new("/workspace").join(DEFAULT_DEBUG_LOG_FILE));
+    }
+
+    #[test]
+    fn test_resolve_debug_log_path_prefers_explicit_file() {
+        let path = resolve_debug_log_path(
+            Some("0"),
+            Some("logs/kiro-debug.log"),
+            Some(Path::new("/workspace")),
+        )
+        .expect("explicit path should enable debug log");
+        assert_eq!(path, Path::new("/workspace/logs/kiro-debug.log"));
+    }
 }
