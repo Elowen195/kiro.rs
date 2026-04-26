@@ -4,7 +4,9 @@
 //! 支持多凭据 (MultiTokenManager) 管理
 
 use anyhow::bail;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc, Weekday,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -535,6 +537,8 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+const US_EASTERN_STANDARD_OFFSET_SECS: i32 = 5 * 60 * 60;
+const US_EASTERN_DAYLIGHT_OFFSET_SECS: i32 = 4 * 60 * 60;
 
 /// API 调用上下文
 ///
@@ -703,7 +707,121 @@ impl MultiTokenManager {
 
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
+        self.auto_recover_quota_exhausted_entries_if_due();
         self.entries.lock().iter().filter(|e| !e.disabled).count()
+    }
+
+    fn nth_weekday_of_month(year: i32, month: u32, weekday: Weekday, nth: u32) -> NaiveDate {
+        let first_day = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month start");
+        let offset = (7 + weekday.num_days_from_monday() as i64
+            - first_day.weekday().num_days_from_monday() as i64)
+            % 7;
+        let day = 1 + offset as u32 + (nth - 1) * 7;
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid nth weekday")
+    }
+
+    fn us_eastern_offset_for_local(local: NaiveDateTime) -> FixedOffset {
+        let year = local.year();
+        let dst_start = Self::nth_weekday_of_month(year, 3, Weekday::Sun, 2)
+            .and_hms_opt(2, 0, 0)
+            .expect("valid dst start");
+        let dst_end = Self::nth_weekday_of_month(year, 11, Weekday::Sun, 1)
+            .and_hms_opt(2, 0, 0)
+            .expect("valid dst end");
+
+        if local >= dst_start && local < dst_end {
+            FixedOffset::west_opt(US_EASTERN_DAYLIGHT_OFFSET_SECS).expect("valid edt offset")
+        } else {
+            FixedOffset::west_opt(US_EASTERN_STANDARD_OFFSET_SECS).expect("valid est offset")
+        }
+    }
+
+    fn us_eastern_offset_for_utc(now: DateTime<Utc>) -> FixedOffset {
+        let year = now.year();
+        let est = FixedOffset::west_opt(US_EASTERN_STANDARD_OFFSET_SECS).expect("valid est offset");
+        let edt = FixedOffset::west_opt(US_EASTERN_DAYLIGHT_OFFSET_SECS).expect("valid edt offset");
+
+        let dst_start_utc = est
+            .from_local_datetime(
+                &Self::nth_weekday_of_month(year, 3, Weekday::Sun, 2)
+                    .and_hms_opt(2, 0, 0)
+                    .expect("valid dst start"),
+            )
+            .single()
+            .expect("unambiguous dst start")
+            .with_timezone(&Utc);
+        let dst_end_utc = edt
+            .from_local_datetime(
+                &Self::nth_weekday_of_month(year, 11, Weekday::Sun, 1)
+                    .and_hms_opt(2, 0, 0)
+                    .expect("valid dst end"),
+            )
+            .single()
+            .expect("unambiguous dst end")
+            .with_timezone(&Utc);
+
+        if now >= dst_start_utc && now < dst_end_utc {
+            edt
+        } else {
+            est
+        }
+    }
+
+    fn current_us_eastern_month_start_utc(now: DateTime<Utc>) -> DateTime<Utc> {
+        let offset_now = Self::us_eastern_offset_for_utc(now);
+        let now_local = now.with_timezone(&offset_now).naive_local();
+        let month_start_local = NaiveDate::from_ymd_opt(now_local.year(), now_local.month(), 1)
+            .expect("valid eastern month start")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid eastern month start time");
+        Self::us_eastern_offset_for_local(month_start_local)
+            .from_local_datetime(&month_start_local)
+            .single()
+            .expect("unambiguous month start")
+            .with_timezone(&Utc)
+    }
+
+    fn auto_recover_quota_exhausted_entries_if_due(&self) {
+        self.auto_recover_quota_exhausted_entries_if_due_at(Utc::now());
+    }
+
+    fn auto_recover_quota_exhausted_entries_if_due_at(&self, now: DateTime<Utc>) {
+        let reset_boundary = Self::current_us_eastern_month_start_utc(now);
+        let recovered_ids = {
+            let mut entries = self.entries.lock();
+            let mut recovered = Vec::new();
+
+            for entry in entries.iter_mut() {
+                if entry.disabled_reason != Some(DisabledReason::QuotaExceeded) {
+                    continue;
+                }
+
+                let exhausted_at = entry
+                    .last_used_at
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc));
+
+                if exhausted_at.is_some_and(|value| value < reset_boundary) {
+                    entry.disabled = false;
+                    entry.disabled_reason = None;
+                    entry.failure_count = 0;
+                    entry.refresh_failure_count = 0;
+                    recovered.push(entry.id);
+                }
+            }
+
+            recovered
+        };
+
+        if !recovered_ids.is_empty() {
+            self.select_highest_priority();
+            tracing::info!(
+                recovered_credentials = ?recovered_ids,
+                reset_boundary = %reset_boundary,
+                "已到美国东部时间月初，自动恢复额度耗尽的凭据"
+            );
+        }
     }
 
     /// 根据负载均衡模式选择下一个凭据
@@ -796,6 +914,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         excluded_ids: Option<&HashSet<u64>>,
     ) -> anyhow::Result<CallContext> {
+        self.auto_recover_quota_exhausted_entries_if_due();
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1469,6 +1588,7 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        self.auto_recover_quota_exhausted_entries_if_due();
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -2583,6 +2703,84 @@ mod tests {
             err
         );
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_multi_token_manager_quota_disabled_auto_recovers_at_us_eastern_month_boundary() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.report_quota_exhausted(1);
+        manager.report_quota_exhausted(2);
+        assert_eq!(manager.available_count(), 0);
+
+        {
+            let mut entries = manager.entries.lock();
+            entries
+                .iter_mut()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .last_used_at = Some("2026-04-30T23:59:59-04:00".to_string());
+            entries
+                .iter_mut()
+                .find(|e| e.id == 2)
+                .unwrap()
+                .last_used_at = Some("2026-04-30T20:00:00-04:00".to_string());
+        }
+
+        manager.auto_recover_quota_exhausted_entries_if_due_at(
+            DateTime::parse_from_rfc3339("2026-05-01T00:00:00-04:00")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+
+        let entries = manager.entries.lock();
+        assert!(entries.iter().all(|entry| !entry.disabled));
+        assert!(entries.iter().all(|entry| entry.disabled_reason.is_none()));
+    }
+
+    #[test]
+    fn test_multi_token_manager_quota_disabled_not_recovered_before_us_eastern_month_boundary() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.report_quota_exhausted(1);
+        manager.report_quota_exhausted(2);
+        assert_eq!(manager.available_count(), 0);
+
+        {
+            let mut entries = manager.entries.lock();
+            entries
+                .iter_mut()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .last_used_at = Some("2026-04-30T23:59:59-04:00".to_string());
+            entries
+                .iter_mut()
+                .find(|e| e.id == 2)
+                .unwrap()
+                .last_used_at = Some("2026-04-30T20:00:00-04:00".to_string());
+        }
+
+        manager.auto_recover_quota_exhausted_entries_if_due_at(
+            DateTime::parse_from_rfc3339("2026-04-30T23:59:59-04:00")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+
+        let entries = manager.entries.lock();
+        assert!(entries.iter().all(|entry| entry.disabled));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.disabled_reason == Some(DisabledReason::QuotaExceeded)));
     }
 
     // ============ 凭据级 Region 优先级测试 ============

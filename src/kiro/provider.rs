@@ -241,6 +241,14 @@ fn dump_upstream_response_error(
     }));
 }
 
+fn is_quota_exhausted_response(
+    status: reqwest::StatusCode,
+    endpoint: &dyn KiroEndpoint,
+    body: &str,
+) -> bool {
+    matches!(status.as_u16(), 400 | 402) && endpoint.is_monthly_request_limit(body)
+}
+
 impl KiroProvider {
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
@@ -442,8 +450,8 @@ impl KiroProvider {
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
-            // 402 额度用尽
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 400/402 额度用尽：兼容上游返回 ServiceQuotaExceededException + MONTHLY_REQUEST_COUNT
+            if is_quota_exhausted_response(status, endpoint.as_ref(), &body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -651,8 +659,8 @@ impl KiroProvider {
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
 
-            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 400/402 月度额度用尽：禁用凭据并故障转移
+            if is_quota_exhausted_response(status, endpoint.as_ref(), &body) {
                 dump_upstream_response_error(
                     &UpstreamDebugAttempt {
                         api_type,
@@ -928,7 +936,10 @@ impl KiroProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_UPSTREAM_DEBUG_FILE, resolve_upstream_debug_path};
+    use super::{
+        DEFAULT_UPSTREAM_DEBUG_FILE, is_quota_exhausted_response, resolve_upstream_debug_path,
+    };
+    use crate::kiro::endpoint::CliEndpoint;
     use std::path::Path;
 
     #[test]
@@ -956,5 +967,38 @@ mod tests {
         )
         .expect("explicit file should enable debug dump");
         assert_eq!(path, Path::new("/workspace/logs/upstream.ndjson"));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_response_detects_monthly_limit_on_400() {
+        let endpoint = CliEndpoint::new();
+        let body = r#"{"__type":"com.amazon.aws.codewhisperer#ServiceQuotaExceededException","message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
+        assert!(is_quota_exhausted_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            &endpoint,
+            body
+        ));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_response_detects_monthly_limit_on_402() {
+        let endpoint = CliEndpoint::new();
+        let body = r#"{"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
+        assert!(is_quota_exhausted_response(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            &endpoint,
+            body
+        ));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_response_ignores_regular_bad_request() {
+        let endpoint = CliEndpoint::new();
+        let body = r#"{"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"Improperly formed request."}"#;
+        assert!(!is_quota_exhausted_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            &endpoint,
+            body
+        ));
     }
 }
