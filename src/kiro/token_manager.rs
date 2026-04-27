@@ -64,6 +64,17 @@ fn is_temporarily_suspended_response(status: reqwest::StatusCode, body: &str) ->
     status.as_u16() == 403 && body.contains("TEMPORARILY_SUSPENDED")
 }
 
+fn is_builder_id_profile_resolution_unsupported(status: reqwest::StatusCode, body: &str) -> bool {
+    status.as_u16() == 403 && body.contains("AWS Builder ID is not supported for this operation.")
+}
+
+fn builder_id_placeholder_profile_arn(region: &str) -> String {
+    format!(
+        "arn:aws:codewhisperer:{}:638616132270:profile/AAAACCCCXXXX",
+        region
+    )
+}
+
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
 fn mask_api_key(key: &str) -> String {
     if key.is_ascii() && key.len() > 16 {
@@ -192,6 +203,9 @@ async fn resolve_cli_profile_arn(
                 message: format!("凭据已被上游临时封禁: {} {}", status, body),
             }
             .into());
+        }
+        if is_builder_id_profile_resolution_unsupported(status, &body) {
+            return Ok(Some(builder_id_placeholder_profile_arn(region)));
         }
         bail!("ListAvailableProfiles 调用失败: {} {}", status, body);
     }
@@ -2415,6 +2429,28 @@ mod tests {
         assert_eq!(
             result,
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[test]
+    fn test_is_builder_id_profile_resolution_unsupported() {
+        let body =
+            r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"AWS Builder ID is not supported for this operation."}"#;
+        assert!(is_builder_id_profile_resolution_unsupported(
+            reqwest::StatusCode::FORBIDDEN,
+            body
+        ));
+        assert!(!is_builder_id_profile_resolution_unsupported(
+            reqwest::StatusCode::BAD_REQUEST,
+            body
+        ));
+    }
+
+    #[test]
+    fn test_builder_id_placeholder_profile_arn() {
+        assert_eq!(
+            builder_id_placeholder_profile_arn("us-east-1"),
+            "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
         );
     }
 
