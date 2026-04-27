@@ -249,6 +249,20 @@ fn is_quota_exhausted_response(
     matches!(status.as_u16(), 400 | 402) && endpoint.is_monthly_request_limit(body)
 }
 
+fn is_missing_profile_arn_response(
+    status: reqwest::StatusCode,
+    endpoint_name: &str,
+    body: &str,
+) -> bool {
+    status.as_u16() == 400
+        && endpoint_name == CLI_ENDPOINT_NAME
+        && body.contains("profileArn is required for this request")
+}
+
+fn is_temporarily_suspended_response(status: reqwest::StatusCode, body: &str) -> bool {
+    status.as_u16() == 403 && body.contains("TEMPORARILY_SUSPENDED")
+}
+
 impl KiroProvider {
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
@@ -467,6 +481,15 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                if is_temporarily_suspended_response(status, &body) {
+                    let has_available = self.token_manager.report_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -706,6 +729,55 @@ impl KiroProvider {
                 continue;
             }
 
+            if is_missing_profile_arn_response(status, endpoint.name(), &body) {
+                dump_upstream_response_error(
+                    &UpstreamDebugAttempt {
+                        api_type,
+                        attempt: attempt + 1,
+                        max_retries,
+                        credential_id: ctx.id,
+                        endpoint_name: endpoint.name(),
+                        url: &url,
+                        is_stream,
+                        model: model.as_deref(),
+                        avoided_credentials: &transient_avoided_ids,
+                        request_body: debug_request_body.as_deref(),
+                    },
+                    "missing_profile_arn",
+                    status,
+                    &response_headers,
+                    &body,
+                );
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    endpoint = endpoint.name(),
+                    "API 请求失败（当前凭据缺少 profileArn，切换下一张，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+
+                transient_avoided_ids.insert(ctx.id);
+                let has_available = self.token_manager.report_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
                 dump_upstream_response_error(
@@ -731,6 +803,53 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                if is_temporarily_suspended_response(status, &body) {
+                    dump_upstream_response_error(
+                        &UpstreamDebugAttempt {
+                            api_type,
+                            attempt: attempt + 1,
+                            max_retries,
+                            credential_id: ctx.id,
+                            endpoint_name: endpoint.name(),
+                            url: &url,
+                            is_stream,
+                            model: model.as_deref(),
+                            avoided_credentials: &transient_avoided_ids,
+                            request_body: debug_request_body.as_deref(),
+                        },
+                        "temporarily_suspended",
+                        status,
+                        &response_headers,
+                        &body,
+                    );
+                    tracing::error!(
+                        credential_id = ctx.id,
+                        "API 请求失败（凭据已被上游临时封禁，禁用并切换，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+
+                    let has_available = self.token_manager.report_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 dump_upstream_response_error(
                     &UpstreamDebugAttempt {
                         api_type,
@@ -937,9 +1056,11 @@ impl KiroProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_UPSTREAM_DEBUG_FILE, is_quota_exhausted_response, resolve_upstream_debug_path,
+        DEFAULT_UPSTREAM_DEBUG_FILE, is_missing_profile_arn_response, is_quota_exhausted_response,
+        is_temporarily_suspended_response, resolve_upstream_debug_path,
     };
     use crate::kiro::endpoint::CliEndpoint;
+    use crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
     use std::path::Path;
 
     #[test]
@@ -999,6 +1120,52 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             &endpoint,
             body
+        ));
+    }
+
+    #[test]
+    fn test_is_missing_profile_arn_response_for_cli() {
+        let body = r#"{"__type":"com.amazon.kiro.runtimeservice#ValidationException","message":"profileArn is required for this request."}"#;
+        assert!(is_missing_profile_arn_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            CLI_ENDPOINT_NAME,
+            body
+        ));
+    }
+
+    #[test]
+    fn test_is_missing_profile_arn_response_ignores_other_cases() {
+        let body = r#"{"message":"Improperly formed request."}"#;
+        assert!(!is_missing_profile_arn_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            CLI_ENDPOINT_NAME,
+            body
+        ));
+        assert!(!is_missing_profile_arn_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            "ide",
+            r#"{"message":"profileArn is required for this request."}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_temporarily_suspended_response_detects_403_reason() {
+        let body = r#"{"reason":"TEMPORARILY_SUSPENDED","message":"Your User ID is temporarily suspended."}"#;
+        assert!(is_temporarily_suspended_response(
+            reqwest::StatusCode::FORBIDDEN,
+            body
+        ));
+    }
+
+    #[test]
+    fn test_is_temporarily_suspended_response_ignores_other_cases() {
+        assert!(!is_temporarily_suspended_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#
+        ));
+        assert!(!is_temporarily_suspended_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"reason":"ACCESS_DENIED"}"#
         ));
     }
 }

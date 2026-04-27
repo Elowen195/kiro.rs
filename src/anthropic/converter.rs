@@ -713,7 +713,7 @@ fn wrap_cli_current_message_content(content: &str) -> String {
 
     let now = Local::now().format("%A, %Y-%m-%dT%H:%M:%S%.3f%:z");
     format!(
-        "--- CONTEXT ENTRY BEGIN ---\nCurrent time: {}\n--- CONTEXT ENTRY END ---\n\n--- USER MESSAGE BEGIN ---\n{}\n--- USER MESSAGE END ---",
+        "--- CONTEXT ENTRY BEGIN ---\nCurrent time: {}\n--- CONTEXT ENTRY END ---\n\n--- USER MESSAGE BEGIN ---\n{}--- USER MESSAGE END ---",
         now, content
     )
 }
@@ -1338,6 +1338,12 @@ mod tests {
     #[test]
     fn test_map_model_passthrough() {
         assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
+        assert_eq!(map_model("deepseek-3.2"), Some("deepseek-3.2".to_string()));
+        assert_eq!(map_model("minimax-m2.5"), Some("minimax-m2.5".to_string()));
+        assert_eq!(
+            map_model("qwen3-coder-next"),
+            Some("qwen3-coder-next".to_string())
+        );
         assert_eq!(map_model("auto"), Some("auto".to_string()));
     }
 
@@ -1384,6 +1390,14 @@ mod tests {
                 .user_input_message
                 .content
                 .contains("--- USER MESSAGE BEGIN ---")
+        );
+        assert!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+                .ends_with("Hello--- USER MESSAGE END ---")
         );
         assert!(
             result
@@ -1850,31 +1864,33 @@ mod tests {
     fn test_convert_request_passthrough_model_id() {
         use super::super::types::Message as AnthropicMessage;
 
-        let req = MessagesRequest {
-            model: "glm-5".to_string(),
-            max_tokens: 1024,
-            messages: vec![AnthropicMessage {
-                role: "user".to_string(),
-                content: serde_json::json!("Hello"),
-            }],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-        };
+        for model in ["glm-5", "deepseek-3.2", "minimax-m2.5", "qwen3-coder-next"] {
+            let req = MessagesRequest {
+                model: model.to_string(),
+                max_tokens: 1024,
+                messages: vec![AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Hello"),
+                }],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+            };
 
-        let result = convert_request(&req).unwrap();
-        assert_eq!(
-            result
-                .conversation_state
-                .current_message
-                .user_input_message
-                .model_id,
-            "glm-5"
-        );
+            let result = convert_request(&req).unwrap();
+            assert_eq!(
+                result
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .model_id,
+                model
+            );
+        }
     }
 
     #[test]

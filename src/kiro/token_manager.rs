@@ -60,6 +60,10 @@ fn needs_profile_arn_sync(profile_arn: &Option<String>, sync_attempted: bool) ->
     profile_arn.is_none() && !sync_attempted
 }
 
+fn is_temporarily_suspended_response(status: reqwest::StatusCode, body: &str) -> bool {
+    status.as_u16() == 403 && body.contains("TEMPORARILY_SUSPENDED")
+}
+
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
 fn mask_api_key(key: &str) -> String {
     if key.is_ascii() && key.len() > 16 {
@@ -108,6 +112,127 @@ impl fmt::Display for RefreshTokenInvalidError {
 }
 
 impl std::error::Error for RefreshTokenInvalidError {}
+
+/// 凭据被上游临时封禁错误
+#[derive(Debug)]
+pub(crate) struct TemporarilySuspendedError {
+    pub message: String,
+}
+
+impl fmt::Display for TemporarilySuspendedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for TemporarilySuspendedError {}
+
+const CLI_RUNTIME_SDK_VERSION: &str = "aws-sdk-rust/1.3.14";
+const CLI_RUNTIME_API_VERSION: &str = "api/codewhispererruntime/0.1.14474";
+const CLI_RUNTIME_LANG_VERSION: &str = "lang/rust/1.92.0";
+
+fn cli_runtime_user_agent(config: &Config) -> String {
+    format!(
+        "{} ua/2.1 {} os/linux {} md/appVersion-{} app/AmazonQ-For-CLI",
+        CLI_RUNTIME_SDK_VERSION,
+        CLI_RUNTIME_API_VERSION,
+        CLI_RUNTIME_LANG_VERSION,
+        config.kiro_version
+    )
+}
+
+fn cli_runtime_x_amz_user_agent() -> String {
+    format!(
+        "{} ua/2.1 {} os/linux {} m/F,C app/AmazonQ-For-CLI",
+        CLI_RUNTIME_SDK_VERSION, CLI_RUNTIME_API_VERSION, CLI_RUNTIME_LANG_VERSION
+    )
+}
+
+async fn resolve_cli_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let url = format!("https://{}/?origin=KIRO_CLI", host);
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut request = client
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererService.ListAvailableProfiles",
+        )
+        .header("x-amz-user-agent", cli_runtime_x_amz_user_agent())
+        .header("user-agent", cli_runtime_user_agent(config))
+        .header("x-amzn-codewhisperer-optout", "false")
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("accept", "*/*")
+        .header("accept-encoding", "gzip")
+        .header("Connection", "close")
+        .body(r#"{"origin":"KIRO_CLI"}"#.to_string());
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        if is_temporarily_suspended_response(status, &body) {
+            return Err(TemporarilySuspendedError {
+                message: format!("凭据已被上游临时封禁: {} {}", status, body),
+            }
+            .into());
+        }
+        bail!("ListAvailableProfiles 调用失败: {} {}", status, body);
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("解析 ListAvailableProfiles 响应失败: {}: {}", e, body))?;
+
+    Ok(payload
+        .get("profiles")
+        .and_then(|v| v.as_array())
+        .and_then(|profiles| {
+            profiles.iter().find_map(|item| {
+                item.get("profileArn")
+                    .or_else(|| item.get("arn"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+        }))
+}
+
+async fn sync_profile_arn_if_missing(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    if credentials.profile_arn.is_some() {
+        return Ok(credentials.clone());
+    }
+
+    let token = credentials
+        .access_token
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("同步 profileArn 需要 accessToken"))?;
+
+    let resolved = resolve_cli_profile_arn(credentials, config, token, proxy).await?;
+    let mut new_credentials = credentials.clone();
+    if let Some(profile_arn) = resolved {
+        new_credentials.profile_arn = Some(profile_arn);
+    }
+    Ok(new_credentials)
+}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -432,6 +557,8 @@ enum DisabledReason {
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
     QuotaExceeded,
+    /// 账号被上游临时封禁（如 TEMPORARILY_SUSPENDED）
+    Suspended,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
@@ -1008,6 +1135,9 @@ impl MultiTokenManager {
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
                         self.report_refresh_token_invalid(id)
+                    } else if e.downcast_ref::<TemporarilySuspendedError>().is_some() {
+                        tracing::warn!("凭据 #{} 已被上游临时封禁: {}", id, e);
+                        self.report_suspended(id)
                     } else {
                         tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
                         self.report_refresh_failure(id)
@@ -1082,9 +1212,9 @@ impl MultiTokenManager {
                 })
                 .unwrap_or_else(|| needs_profile_arn_sync(&credentials.profile_arn, false))
         };
-        let needs_refresh = is_token_expired(credentials)
-            || is_token_expiring_soon(credentials)
-            || missing_profile_arn;
+        let needs_token_refresh =
+            is_token_expired(credentials) || is_token_expiring_soon(credentials);
+        let needs_refresh = needs_token_refresh || missing_profile_arn;
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
@@ -1101,18 +1231,34 @@ impl MultiTokenManager {
             };
             let needs_profile_arn_sync =
                 needs_profile_arn_sync(&current_creds.profile_arn, profile_arn_sync_attempted);
+            let needs_token_refresh =
+                is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds);
 
-            if is_token_expired(&current_creds)
-                || is_token_expiring_soon(&current_creds)
-                || needs_profile_arn_sync
-            {
-                if needs_profile_arn_sync {
-                    tracing::debug!("凭据 #{} 缺少 profileArn，尝试通过刷新 Token 同步", id);
-                }
-                // 确实需要刷新
+            if needs_token_refresh || needs_profile_arn_sync {
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                let mut new_creds = if needs_token_refresh {
+                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?
+                } else {
+                    current_creds.clone()
+                };
+
+                if needs_profile_arn_sync {
+                    tracing::debug!(
+                        "凭据 #{} 缺少 profileArn，尝试通过 ListAvailableProfiles 同步",
+                        id
+                    );
+                    new_creds = sync_profile_arn_if_missing(
+                        &new_creds,
+                        &self.config,
+                        effective_proxy.as_ref(),
+                    )
+                    .await?;
+                    if new_creds.profile_arn.is_some() {
+                        tracing::info!("凭据 #{} 已同步 profileArn", id);
+                    } else {
+                        tracing::warn!("凭据 #{} 未能从 ListAvailableProfiles 获取 profileArn", id);
+                    }
+                }
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1129,7 +1275,7 @@ impl MultiTokenManager {
 
                 // 回写凭据到文件（仅多凭据格式），失败只记录警告
                 if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                    tracing::warn!("凭据刷新/同步后持久化失败（不影响本次请求）: {}", e);
                 }
 
                 new_creds
@@ -1445,6 +1591,54 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据已被上游临时封禁。
+    ///
+    /// 命中 TEMPORARILY_SUSPENDED 时立即禁用，不累计失败。
+    pub fn report_suspended(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::Suspended);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!(
+                "凭据 #{} 已被上游临时封禁（TEMPORARILY_SUSPENDED），已禁用",
+                id
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
@@ -1646,6 +1840,7 @@ impl MultiTokenManager {
                             DisabledReason::TooManyFailures => "TooManyFailures",
                             DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::Suspended => "Suspended",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                             DisabledReason::InvalidConfig => "InvalidConfig",
                         }
@@ -1911,7 +2106,9 @@ impl MultiTokenManager {
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            let refreshed =
+                refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
+            sync_profile_arn_if_missing(&refreshed, &self.config, effective_proxy.as_ref()).await?
         };
 
         // 4. 分配新 ID
@@ -2049,7 +2246,9 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let refreshed = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds =
+            sync_profile_arn_if_missing(&refreshed, &self.config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -2678,6 +2877,27 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
     }
 
+    #[test]
+    fn test_multi_token_manager_report_suspended() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.available_count(), 2);
+        assert!(manager.report_suspended(1));
+        assert_eq!(manager.available_count(), 1);
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.disabled_reason.as_deref(), Some("Suspended"));
+        assert_eq!(first.failure_count, MAX_FAILURES_PER_CREDENTIAL);
+        assert_eq!(snapshot.current_id, 2);
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_quota_disabled_is_not_auto_recovered() {
         let config = Config::default();
@@ -2720,16 +2940,10 @@ mod tests {
 
         {
             let mut entries = manager.entries.lock();
-            entries
-                .iter_mut()
-                .find(|e| e.id == 1)
-                .unwrap()
-                .last_used_at = Some("2026-04-30T23:59:59-04:00".to_string());
-            entries
-                .iter_mut()
-                .find(|e| e.id == 2)
-                .unwrap()
-                .last_used_at = Some("2026-04-30T20:00:00-04:00".to_string());
+            entries.iter_mut().find(|e| e.id == 1).unwrap().last_used_at =
+                Some("2026-04-30T23:59:59-04:00".to_string());
+            entries.iter_mut().find(|e| e.id == 2).unwrap().last_used_at =
+                Some("2026-04-30T20:00:00-04:00".to_string());
         }
 
         manager.auto_recover_quota_exhausted_entries_if_due_at(
@@ -2758,16 +2972,10 @@ mod tests {
 
         {
             let mut entries = manager.entries.lock();
-            entries
-                .iter_mut()
-                .find(|e| e.id == 1)
-                .unwrap()
-                .last_used_at = Some("2026-04-30T23:59:59-04:00".to_string());
-            entries
-                .iter_mut()
-                .find(|e| e.id == 2)
-                .unwrap()
-                .last_used_at = Some("2026-04-30T20:00:00-04:00".to_string());
+            entries.iter_mut().find(|e| e.id == 1).unwrap().last_used_at =
+                Some("2026-04-30T23:59:59-04:00".to_string());
+            entries.iter_mut().find(|e| e.id == 2).unwrap().last_used_at =
+                Some("2026-04-30T20:00:00-04:00".to_string());
         }
 
         manager.auto_recover_quota_exhausted_entries_if_due_at(
@@ -2778,9 +2986,11 @@ mod tests {
 
         let entries = manager.entries.lock();
         assert!(entries.iter().all(|entry| entry.disabled));
-        assert!(entries
-            .iter()
-            .all(|entry| entry.disabled_reason == Some(DisabledReason::QuotaExceeded)));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.disabled_reason == Some(DisabledReason::QuotaExceeded))
+        );
     }
 
     // ============ 凭据级 Region 优先级测试 ============

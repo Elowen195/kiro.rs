@@ -49,6 +49,27 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatDisabledReason(reason?: string): string | null {
+  switch (reason) {
+    case 'Manual':
+      return '手动禁用'
+    case 'TooManyFailures':
+      return '连续失败过多'
+    case 'TooManyRefreshFailures':
+      return '刷新失败过多'
+    case 'QuotaExceeded':
+      return '月额度耗尽'
+    case 'Suspended':
+      return '上游封禁'
+    case 'InvalidRefreshToken':
+      return 'Refresh Token 失效'
+    case 'InvalidConfig':
+      return '配置无效'
+    default:
+      return reason ?? null
+  }
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -66,6 +87,8 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const formattedDisabledReason = formatDisabledReason(credential.disabledReason)
+  const isSuspended = credential.disabledReason === 'Suspended'
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -157,10 +180,10 @@ export function CredentialCard({
                   <Badge variant="success">当前</Badge>
                 )}
                 {credential.disabled && (
-                  <Badge variant="destructive">已禁用</Badge>
+                  <Badge variant="destructive">{isSuspended ? '已封禁' : '已禁用'}</Badge>
                 )}
-                {credential.disabled && credential.disabledReason && (
-                  <Badge variant="outline">{credential.disabledReason}</Badge>
+                {credential.disabled && formattedDisabledReason && (
+                  <Badge variant="outline">{formattedDisabledReason}</Badge>
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
