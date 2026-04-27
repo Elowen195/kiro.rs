@@ -2,7 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use chrono::Local;
@@ -522,17 +522,31 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
     // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
-    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+    let mut messages: Vec<super::types::Message> = if req.messages.last().is_some_and(|m| m.role != "user") {
         tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
         let last_user_idx = req
             .messages
             .iter()
             .rposition(|m| m.role == "user")
             .ok_or(ConversionError::EmptyMessages)?;
-        &req.messages[..=last_user_idx]
+        req.messages[..=last_user_idx].to_vec()
     } else {
-        &req.messages
+        req.messages.clone()
     };
+
+    // 2.6. 清理已知的无效工具重试环路，避免继续消息时反复重放错误的 Write 空参数调用
+    sanitize_invalid_tool_retry_messages(&mut messages);
+    if messages.is_empty() {
+        return Err(ConversionError::EmptyMessages);
+    }
+    if messages.last().is_some_and(|m| m.role != "user") {
+        tracing::info!("清理无效工具历史后末尾不再是 user，重新截断到最后一条 user");
+        let last_user_idx = messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .ok_or(ConversionError::EmptyMessages)?;
+        messages.truncate(last_user_idx + 1);
+    }
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
@@ -548,7 +562,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let chat_trigger_type = determine_chat_trigger_type(req);
 
     // 5. 处理末尾连续的 user 消息作为当前轮次，避免多条 tool_result 被拆散
-    let current_turn_start = find_current_user_turn_start(messages);
+    let current_turn_start = find_current_user_turn_start(&messages);
     let current_turn_messages: Vec<_> = messages[current_turn_start..].iter().collect();
     let (text_content, images, tool_results) = collect_user_message_parts(&current_turn_messages)?;
 
@@ -559,7 +573,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(
         req,
-        messages,
+        &messages,
         current_turn_start,
         &model_id,
         &mut tool_name_map,
@@ -774,6 +788,181 @@ fn process_message_content(
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
+}
+
+fn sanitize_invalid_tool_retry_messages(messages: &mut Vec<super::types::Message>) {
+    let invalid_candidates = collect_invalid_write_tool_use_candidates(messages);
+    if invalid_candidates.is_empty() {
+        return;
+    }
+
+    let confirmed_ids = collect_confirmed_invalid_write_tool_results(messages, &invalid_candidates);
+    if confirmed_ids.is_empty() {
+        return;
+    }
+
+    let original_count = messages.len();
+    for msg in messages.iter_mut() {
+        if let serde_json::Value::Array(arr) = &mut msg.content {
+            arr.retain(|item| !is_invalid_tool_retry_block(item, &confirmed_ids));
+        }
+    }
+    messages.retain(message_has_meaningful_content);
+
+    tracing::warn!(
+        removed_tool_retry_count = confirmed_ids.len(),
+        message_count_before = original_count,
+        message_count_after = messages.len(),
+        "清理了无效的 Write 工具重试历史"
+    );
+}
+
+fn collect_invalid_write_tool_use_candidates(
+    messages: &[super::types::Message],
+) -> HashSet<String> {
+    let mut candidates = HashSet::new();
+
+    for msg in messages {
+        if msg.role != "assistant" {
+            continue;
+        }
+
+        let serde_json::Value::Array(arr) = &msg.content else {
+            continue;
+        };
+
+        for item in arr {
+            let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) else {
+                continue;
+            };
+
+            if block.block_type != "tool_use" {
+                continue;
+            }
+
+            let (Some(id), Some(name)) = (block.id.as_ref(), block.name.as_ref()) else {
+                continue;
+            };
+
+            if is_invalid_write_tool_use(name, block.input.as_ref()) {
+                candidates.insert(id.clone());
+            }
+        }
+    }
+
+    candidates
+}
+
+fn collect_confirmed_invalid_write_tool_results(
+    messages: &[super::types::Message],
+    candidates: &HashSet<String>,
+) -> HashSet<String> {
+    let mut confirmed_ids = HashSet::new();
+
+    for msg in messages {
+        if msg.role != "user" {
+            continue;
+        }
+
+        let serde_json::Value::Array(arr) = &msg.content else {
+            continue;
+        };
+
+        for item in arr {
+            let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) else {
+                continue;
+            };
+
+            if block.block_type != "tool_result" || !block.is_error.unwrap_or(false) {
+                continue;
+            }
+
+            let Some(tool_use_id) = block.tool_use_id.as_ref() else {
+                continue;
+            };
+
+            if !candidates.contains(tool_use_id) {
+                continue;
+            }
+
+            let result_content = extract_tool_result_content(&block.content);
+            if is_invalid_write_tool_result(&result_content) {
+                confirmed_ids.insert(tool_use_id.clone());
+            }
+        }
+    }
+
+    confirmed_ids
+}
+
+fn is_invalid_write_tool_use(name: &str, input: Option<&serde_json::Value>) -> bool {
+    if !name.eq_ignore_ascii_case("Write") {
+        return false;
+    }
+
+    let Some(serde_json::Value::Object(obj)) = input else {
+        return true;
+    };
+
+    let missing_file_path = obj
+        .get("file_path")
+        .and_then(|value| value.as_str())
+        .is_none_or(|value| value.trim().is_empty());
+    let missing_content = obj
+        .get("content")
+        .and_then(|value| value.as_str())
+        .is_none_or(|value| value.is_empty());
+
+    missing_file_path && missing_content
+}
+
+fn is_invalid_write_tool_result(content: &str) -> bool {
+    content.contains("InputValidationError")
+        && content.contains("Write failed")
+        && content.contains("`file_path`")
+        && content.contains("`content`")
+}
+
+fn is_invalid_tool_retry_block(item: &serde_json::Value, confirmed_ids: &HashSet<String>) -> bool {
+    let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) else {
+        return false;
+    };
+
+    match block.block_type.as_str() {
+        "tool_use" => block
+            .id
+            .as_ref()
+            .is_some_and(|tool_use_id| confirmed_ids.contains(tool_use_id)),
+        "tool_result" => block
+            .tool_use_id
+            .as_ref()
+            .is_some_and(|tool_use_id| confirmed_ids.contains(tool_use_id)),
+        _ => false,
+    }
+}
+
+fn message_has_meaningful_content(msg: &super::types::Message) -> bool {
+    match &msg.content {
+        serde_json::Value::String(content) => !content.trim().is_empty(),
+        serde_json::Value::Array(arr) => arr.iter().any(content_block_has_meaningful_content),
+        _ => true,
+    }
+}
+
+fn content_block_has_meaningful_content(item: &serde_json::Value) -> bool {
+    let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) else {
+        return true;
+    };
+
+    match block.block_type.as_str() {
+        "text" => block.text.as_ref().is_some_and(|text| !text.trim().is_empty()),
+        "thinking" => block
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| !thinking.trim().is_empty()),
+        "tool_use" | "tool_result" | "image" => true,
+        _ => true,
+    }
 }
 
 /// 从 media_type 获取图片格式
@@ -1960,6 +2149,180 @@ mod tests {
             }
             Message::User(_) => panic!("history should end with assistant tool_use turn"),
         }
+    }
+
+    #[test]
+    fn test_convert_request_strips_invalid_write_retry_loop_from_history_and_current_turn() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let invalid_error = "<tool_use_error>InputValidationError: Write failed due to the following issues:\nThe required parameter `file_path` is missing\nThe required parameter `content` is missing</tool_use_error>";
+        let req = MessagesRequest {
+            model: "glm-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("请生成完整的架构和提示词文档。"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "我已经读取了所有核心文件。现在让我生成完整的架构和提示词文档。"},
+                        {"type": "tool_use", "id": "tooluse_bad_1", "name": "Write", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tooluse_bad_1", "is_error": true, "content": invalid_error}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "我来生成完整的架构和提示词文档。"},
+                        {"type": "tool_use", "id": "tooluse_bad_2", "name": "Write", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tooluse_bad_2", "is_error": true, "content": invalid_error}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("继续"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("conversion should succeed");
+        let state = result.conversation_state;
+        let current = state.current_message.user_input_message;
+
+        assert!(
+            current.user_input_message_context.tool_results.is_empty(),
+            "当前轮次不应继续重放无效 Write 错误"
+        );
+        assert!(
+            current.content.contains("继续"),
+            "当前用户继续指令应被保留"
+        );
+
+        for history_message in state.history {
+            match history_message {
+                Message::Assistant(assistant_msg) => {
+                    assert!(
+                        assistant_msg
+                            .assistant_response_message
+                            .tool_uses
+                            .as_ref()
+                            .is_none_or(|tool_uses| tool_uses.iter().all(|tool_use| {
+                                tool_use.tool_use_id != "tooluse_bad_1"
+                                    && tool_use.tool_use_id != "tooluse_bad_2"
+                            })),
+                        "历史中不应保留无效 Write 调用"
+                    );
+                }
+                Message::User(user_msg) => {
+                    assert!(
+                        user_msg
+                            .user_input_message
+                            .user_input_message_context
+                            .tool_results
+                            .iter()
+                            .all(|tool_result| {
+                                tool_result.tool_use_id != "tooluse_bad_1"
+                                    && tool_result.tool_use_id != "tooluse_bad_2"
+                            }),
+                        "历史中不应保留无效 Write 错误结果"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_convert_request_keeps_valid_write_tool_error_history() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "glm-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("写一个文件"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_use",
+                            "id": "tooluse_write_valid",
+                            "name": "Write",
+                            "input": {"file_path": "/tmp/demo.txt", "content": "hello"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tooluse_write_valid",
+                            "is_error": true,
+                            "content": "<tool_use_error>permission denied</tool_use_error>"
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("继续处理权限问题"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("conversion should succeed");
+        let state = result.conversation_state;
+
+        let current_tool_results = &state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(current_tool_results.len(), 1);
+        assert_eq!(current_tool_results[0].tool_use_id, "tooluse_write_valid");
+
+        let assistant_history = state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant(assistant_msg) => assistant_msg
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .filter(|tool_uses| !tool_uses.is_empty()),
+                Message::User(_) => None,
+            })
+            .expect("history should keep valid write tool use");
+        assert_eq!(assistant_history.len(), 1);
+        assert_eq!(assistant_history[0].tool_use_id, "tooluse_write_valid");
     }
 
     #[test]
