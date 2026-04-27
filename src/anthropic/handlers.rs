@@ -27,8 +27,7 @@ use super::middleware::AppState;
 use super::models::{fetch_upstream_models, to_anthropic_models};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
-    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, OutputConfig,
-    Thinking,
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, OutputConfig, Thinking,
 };
 use super::websearch;
 
@@ -559,17 +558,33 @@ fn apply_tool_use_event(
 ) {
     *has_tool_use = true;
 
-    let buffer = tool_json_buffers
-        .entry(tool_use.tool_use_id.clone())
-        .or_insert_with(String::new);
-    buffer.push_str(&tool_use.input);
+    {
+        let buffer = tool_json_buffers
+            .entry(tool_use.tool_use_id.clone())
+            .or_insert_with(String::new);
+        buffer.push_str(&tool_use.input);
+    }
 
     // 如果是完整的工具调用，添加到列表
     if tool_use.stop {
-        let input: serde_json::Value = if buffer.is_empty() {
+        let accumulated_input = tool_json_buffers
+            .remove(&tool_use.tool_use_id)
+            .unwrap_or_default();
+
+        if should_skip_invalid_write_tool_use(&tool_use.name, &accumulated_input) {
+            tracing::warn!(
+                tool_use_id = %tool_use.tool_use_id,
+                input = %accumulated_input,
+                "忽略无效的 Write tool_use：缺少 file_path/content"
+            );
+            *has_tool_use = !tool_uses.is_empty();
+            return;
+        }
+
+        let input: serde_json::Value = if accumulated_input.is_empty() {
             serde_json::json!({})
         } else {
-            serde_json::from_str(buffer).unwrap_or_else(|e| {
+            serde_json::from_str(&accumulated_input).unwrap_or_else(|e| {
                 tracing::warn!(
                     "工具输入 JSON 解析失败: {}, tool_use_id: {}",
                     e,
@@ -591,6 +606,27 @@ fn apply_tool_use_event(
             "input": input
         }));
     }
+}
+
+fn should_skip_invalid_write_tool_use(name: &str, input: &str) -> bool {
+    if !name.eq_ignore_ascii_case("Write") {
+        return false;
+    }
+
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(input) else {
+        return input.trim().is_empty();
+    };
+
+    let has_file_path = obj
+        .get("file_path")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_content = obj
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+
+    !(has_file_path && has_content)
 }
 
 /// 创建 SSE 事件流
@@ -1384,5 +1420,56 @@ mod tests {
         assert_eq!(parsed.tool_uses[0].tool_use_id, "toolu_123");
         assert_eq!(parsed.tool_uses[0].input, r#"{"q":"kiro"}"#);
         assert!(parsed.tool_uses[0].stop);
+    }
+
+    #[test]
+    fn test_apply_tool_use_event_skips_invalid_empty_write() {
+        let mut tool_json_buffers = std::collections::HashMap::new();
+        let mut has_tool_use = false;
+        let mut tool_uses = Vec::new();
+        let tool_name_map = std::collections::HashMap::new();
+
+        apply_tool_use_event(
+            &ToolUseEvent {
+                name: "Write".to_string(),
+                tool_use_id: "tool_write_invalid".to_string(),
+                input: String::new(),
+                stop: true,
+            },
+            &mut tool_json_buffers,
+            &mut has_tool_use,
+            &mut tool_uses,
+            &tool_name_map,
+        );
+
+        assert!(tool_uses.is_empty(), "invalid empty Write should be ignored");
+        assert!(!has_tool_use, "ignored invalid Write should not mark tool_use");
+    }
+
+    #[test]
+    fn test_apply_tool_use_event_keeps_valid_write() {
+        let mut tool_json_buffers = std::collections::HashMap::new();
+        let mut has_tool_use = false;
+        let mut tool_uses = Vec::new();
+        let tool_name_map = std::collections::HashMap::new();
+
+        apply_tool_use_event(
+            &ToolUseEvent {
+                name: "Write".to_string(),
+                tool_use_id: "tool_write_valid".to_string(),
+                input: r#"{"file_path":"/tmp/demo.txt","content":"hello"}"#.to_string(),
+                stop: true,
+            },
+            &mut tool_json_buffers,
+            &mut has_tool_use,
+            &mut tool_uses,
+            &tool_name_map,
+        );
+
+        assert!(has_tool_use, "valid Write should still be marked as tool_use");
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0]["name"], "Write");
+        assert_eq!(tool_uses[0]["input"]["file_path"], "/tmp/demo.txt");
+        assert_eq!(tool_uses[0]["input"]["content"], "hello");
     }
 }

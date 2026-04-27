@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
@@ -140,6 +140,23 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
     }
 
     None
+}
+
+fn is_complete_write_tool_input(input: &str) -> bool {
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(input) else {
+        return false;
+    };
+
+    let has_file_path = obj
+        .get("file_path")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_content = obj
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+
+    has_file_path && has_content
 }
 
 /// 查找真正的 thinking 开始标签（不被引用字符包裹）
@@ -519,6 +536,8 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 工具输入缓冲区 (tool_id -> accumulated input json)
+    pub tool_input_buffers: HashMap<String, String>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
@@ -554,6 +573,7 @@ impl StreamContext {
             context_input_tokens: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
+            tool_input_buffers: HashMap::new(),
             tool_name_map,
             thinking_enabled,
             thinking_buffer: String::new(),
@@ -916,8 +936,6 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        self.state_manager.set_has_tool_use(true);
-
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
@@ -970,15 +988,49 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
-        // 获取或分配块索引
-        let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
-            idx
-        } else {
-            let idx = self.state_manager.next_block_index();
-            self.tool_block_indices
-                .insert(tool_use.tool_use_id.clone(), idx);
-            idx
+        let accumulated_input = {
+            let buffer = self
+                .tool_input_buffers
+                .entry(tool_use.tool_use_id.clone())
+                .or_default();
+            buffer.push_str(&tool_use.input);
+            buffer.clone()
         };
+
+        let is_write_tool = tool_use.name.eq_ignore_ascii_case("Write");
+        let write_input_is_complete = is_complete_write_tool_input(&accumulated_input);
+
+        if is_write_tool && !tool_use.stop && !write_input_is_complete {
+            tracing::debug!(
+                tool_use_id = %tool_use.tool_use_id,
+                "延迟输出 Write tool_use，等待完整参数"
+            );
+            return events;
+        }
+
+        if is_write_tool && tool_use.stop && !write_input_is_complete {
+            tracing::warn!(
+                tool_use_id = %tool_use.tool_use_id,
+                input = %accumulated_input,
+                "抑制无效的 Write tool_use：缺少 file_path/content"
+            );
+            self.tool_input_buffers.remove(&tool_use.tool_use_id);
+            self.tool_block_indices.remove(&tool_use.tool_use_id);
+            return events;
+        }
+
+        self.state_manager.set_has_tool_use(true);
+
+        // 获取或分配块索引
+        let (block_index, first_emission) =
+            if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
+                (idx, false)
+            } else {
+                let idx = self.state_manager.next_block_index();
+                self.tool_block_indices
+                    .insert(tool_use.tool_use_id.clone(), idx);
+                (idx, true)
+            };
 
         // 还原工具名称（如果有映射）
         let original_name = self
@@ -1004,9 +1056,15 @@ impl StreamContext {
         );
         events.extend(start_events);
 
+        let delta_payload = if is_write_tool && first_emission {
+            accumulated_input
+        } else {
+            tool_use.input.clone()
+        };
+
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
-        if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
+        if !delta_payload.is_empty() {
+            self.output_tokens += (delta_payload.len() as i32 + 3) / 4; // 估算 token
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -1015,7 +1073,7 @@ impl StreamContext {
                     "index": block_index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": tool_use.input
+                        "partial_json": delta_payload
                     }
                 }),
             ) {
@@ -1028,6 +1086,7 @@ impl StreamContext {
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
+            self.tool_input_buffers.remove(&tool_use.tool_use_id);
         }
 
         events
@@ -2004,6 +2063,87 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    #[test]
+    fn test_stream_suppresses_invalid_empty_write_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let partial_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_write_1".to_string(),
+            input: String::new(),
+            stop: false,
+        });
+        assert!(
+            partial_events.is_empty(),
+            "empty Write without stop should be buffered instead of emitted"
+        );
+
+        let stop_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_write_1".to_string(),
+            input: String::new(),
+            stop: true,
+        });
+        assert!(
+            stop_events.is_empty(),
+            "invalid empty Write should be suppressed on completion"
+        );
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_stream_buffers_write_until_valid_stop() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let partial_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_write_2".to_string(),
+            input: r#"{"file_path":"/tmp/demo.txt","#.to_string(),
+            stop: false,
+        });
+        assert!(
+            partial_events.is_empty(),
+            "incomplete Write json should be buffered until complete"
+        );
+
+        let final_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_write_2".to_string(),
+            input: r#""content":"hello"}"#.to_string(),
+            stop: true,
+        });
+
+        assert!(
+            final_events.iter().any(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                    && e.data["content_block"]["name"] == "Write"
+            }),
+            "valid Write should still emit tool_use block"
+        );
+        assert!(
+            final_events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "input_json_delta"
+                    && e.data["delta"]["partial_json"]
+                        == r#"{"file_path":"/tmp/demo.txt","content":"hello"}"#
+            }),
+            "buffered Write should emit the full accumulated json once complete"
+        );
+        assert!(
+            final_events.iter().any(|e| e.event == "content_block_stop"),
+            "valid Write should emit stop event"
         );
     }
 }
