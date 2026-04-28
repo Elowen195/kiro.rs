@@ -529,7 +529,10 @@ impl ToolCallIdMapper {
     }
 }
 
-fn convert_assistant_content(msg: &ChatMessage, tool_call_id_mapper: &mut ToolCallIdMapper) -> Value {
+fn convert_assistant_content(
+    msg: &ChatMessage,
+    tool_call_id_mapper: &mut ToolCallIdMapper,
+) -> Value {
     let mut blocks = Vec::<Value>::new();
     if let Some(text) = string_content(&msg.content) {
         if !text.is_empty() {
@@ -571,6 +574,279 @@ fn normalize_schema_to_map(schema: Value) -> std::collections::HashMap<String, V
     }
 }
 
+#[derive(Default)]
+struct OpenAiJsonBodyFallback {
+    text_content: String,
+    tool_calls: Vec<ChatResponseToolCall>,
+    context_usage_percentage: Option<f64>,
+    input_tokens: Option<i32>,
+    output_tokens: Option<i32>,
+}
+
+impl OpenAiJsonBodyFallback {
+    fn is_meaningful(&self) -> bool {
+        !self.text_content.is_empty()
+            || !self.tool_calls.is_empty()
+            || self.context_usage_percentage.is_some()
+            || self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+    }
+}
+
+fn response_content_type_is_json(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().contains("json"))
+        .unwrap_or(false)
+}
+
+fn extract_text_from_content_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.to_string()),
+        Value::Array(arr) => {
+            let mut out = String::new();
+            for item in arr {
+                if item.get("type").and_then(|v| v.as_str()) == Some("text")
+                    && let Some(text) = item.get("text").and_then(|v| v.as_str())
+                {
+                    out.push_str(text);
+                }
+            }
+            if out.is_empty() { None } else { Some(out) }
+        }
+        Value::Object(map) => map
+            .get("text")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+fn first_non_empty_text(root: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        root.pointer(path)
+            .and_then(extract_text_from_content_value)
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn value_as_i32(value: &Value) -> Option<i32> {
+    if let Some(v) = value.as_i64() {
+        return i32::try_from(v).ok();
+    }
+    value.as_u64().and_then(|v| i32::try_from(v).ok())
+}
+
+fn extract_i32_at_paths(root: &Value, paths: &[&str]) -> Option<i32> {
+    paths.iter()
+        .find_map(|path| root.pointer(path).and_then(value_as_i32))
+}
+
+fn extract_f64_at_paths(root: &Value, paths: &[&str]) -> Option<f64> {
+    paths.iter().find_map(|path| {
+        root.pointer(path).and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_i64().map(|v| v as f64))
+                .or_else(|| value.as_u64().map(|v| v as f64))
+        })
+    })
+}
+
+fn append_tool_calls_from_content(
+    content: &Value,
+    out: &mut Vec<ChatResponseToolCall>,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) {
+    let Some(arr) = content.as_array() else {
+        return;
+    };
+
+    for (idx, item) in arr.iter().enumerate() {
+        if item.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+            continue;
+        }
+
+        let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let original_name = tool_name_map
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let arguments = item.get("input").cloned().unwrap_or_else(|| json!({}));
+
+        out.push(ChatResponseToolCall {
+            id: id.to_string(),
+            r#type: "function",
+            function: ChatResponseFunction {
+                name: original_name,
+                arguments: serde_json::to_string(&arguments)
+                    .unwrap_or_else(|_| "{}".to_string()),
+            },
+            index: idx as i32,
+        });
+    }
+}
+
+fn append_tool_calls_from_openai_message(message: &Value, out: &mut Vec<ChatResponseToolCall>) {
+    let Some(arr) = message.get("tool_calls").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    for (idx, tool_call) in arr.iter().enumerate() {
+        let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(name) = tool_call
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let arguments = tool_call
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| Value::String("{}".to_string()));
+
+        out.push(ChatResponseToolCall {
+            id: id.to_string(),
+            r#type: "function",
+            function: ChatResponseFunction {
+                name: name.to_string(),
+                arguments: match arguments {
+                    Value::String(s) => s,
+                    other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+                },
+            },
+            index: idx as i32,
+        });
+    }
+}
+
+fn parse_json_body_fallback(
+    body_bytes: &[u8],
+    tool_name_map: &std::collections::HashMap<String, String>,
+) -> Option<OpenAiJsonBodyFallback> {
+    let root: Value = serde_json::from_slice(body_bytes).ok()?;
+    let mut fallback = OpenAiJsonBodyFallback::default();
+
+    fallback.text_content = first_non_empty_text(
+        &root,
+        &[
+            "/assistantResponseEvent/content",
+            "/assistantResponseMessage/content",
+            "/conversationState/currentMessage/assistantResponseMessage/content",
+            "/choices/0/message/content",
+            "/message/content",
+            "/content",
+        ],
+    )
+    .unwrap_or_default();
+
+    append_tool_calls_from_content(&root["content"], &mut fallback.tool_calls, tool_name_map);
+    if let Some(message) = root.pointer("/choices/0/message") {
+        append_tool_calls_from_openai_message(message, &mut fallback.tool_calls);
+    }
+
+    fallback.context_usage_percentage = extract_f64_at_paths(
+        &root,
+        &[
+            "/contextUsageEvent/contextUsagePercentage",
+            "/contextUsagePercentage",
+        ],
+    );
+    fallback.input_tokens = extract_i32_at_paths(
+        &root,
+        &[
+            "/usage/input_tokens",
+            "/usage/inputTokens",
+            "/usage/prompt_tokens",
+            "/usage/promptTokens",
+        ],
+    );
+    fallback.output_tokens = extract_i32_at_paths(
+        &root,
+        &[
+            "/usage/output_tokens",
+            "/usage/outputTokens",
+            "/usage/completion_tokens",
+            "/usage/completionTokens",
+        ],
+    );
+
+    if let Some(events) = root.get("events").and_then(|v| v.as_array()) {
+        if fallback.text_content.is_empty() {
+            for event in events {
+                if let Some(text) = first_non_empty_text(
+                    event,
+                    &[
+                        "/assistantResponseEvent/content",
+                        "/assistantResponseMessage/content",
+                    ],
+                ) {
+                    fallback.text_content.push_str(&text);
+                }
+            }
+        }
+        for event in events {
+            append_tool_calls_from_content(
+                &event["content"],
+                &mut fallback.tool_calls,
+                tool_name_map,
+            );
+            if let Some(message) = event.pointer("/choices/0/message") {
+                append_tool_calls_from_openai_message(message, &mut fallback.tool_calls);
+            }
+            if fallback.context_usage_percentage.is_none() {
+                fallback.context_usage_percentage = extract_f64_at_paths(
+                    event,
+                    &[
+                        "/contextUsageEvent/contextUsagePercentage",
+                        "/contextUsagePercentage",
+                    ],
+                );
+            }
+            if fallback.input_tokens.is_none() {
+                fallback.input_tokens = extract_i32_at_paths(
+                    event,
+                    &[
+                        "/usage/input_tokens",
+                        "/usage/inputTokens",
+                        "/usage/prompt_tokens",
+                        "/usage/promptTokens",
+                    ],
+                );
+            }
+            if fallback.output_tokens.is_none() {
+                fallback.output_tokens = extract_i32_at_paths(
+                    event,
+                    &[
+                        "/usage/output_tokens",
+                        "/usage/outputTokens",
+                        "/usage/completion_tokens",
+                        "/usage/completionTokens",
+                    ],
+                );
+            }
+        }
+    }
+
+    if fallback.is_meaningful() {
+        Some(fallback)
+    } else {
+        None
+    }
+}
+
 // === 非流式响应 ===
 
 async fn handle_non_stream(
@@ -584,6 +860,7 @@ async fn handle_non_stream(
         Ok(r) => r,
         Err(e) => return map_provider_error(e, Some(&request_body)),
     };
+    let prefer_json_fallback = response_content_type_is_json(&response);
 
     let body_bytes = match response.bytes().await {
         Ok(b) => b,
@@ -610,62 +887,114 @@ async fn handle_non_stream(
     let mut has_tool_use = false;
     let mut stop_reason_openai = "stop".to_string();
     let mut context_input_tokens: Option<i32> = None;
+    let mut upstream_output_tokens: Option<i32> = None;
+    let mut parsed_from_json = false;
 
-    for r in decoder.decode_iter() {
-        let Ok(frame) = r else { continue };
-        let Ok(event) = Event::from_frame(frame) else {
-            continue;
-        };
-        match event {
-            Event::AssistantResponse(resp) => text.push_str(&resp.content),
-            Event::ToolUse(tu) => {
+    if prefer_json_fallback {
+        if let Some(fallback) = parse_json_body_fallback(&body_bytes, &tool_name_map) {
+            parsed_from_json = true;
+            text.push_str(&fallback.text_content);
+            if !fallback.tool_calls.is_empty() {
                 has_tool_use = true;
-                let entry = tool_buffers
-                    .entry(tu.tool_use_id.clone())
-                    .or_insert_with(|| {
-                        tool_order.push(tu.tool_use_id.clone());
-                        let original_name = tool_name_map
-                            .get(&tu.name)
-                            .cloned()
-                            .unwrap_or(tu.name.clone());
-                        (original_name, String::new(), tu.tool_use_id.clone())
-                    });
-                entry.1.push_str(&tu.input);
+                tool_calls = fallback.tool_calls;
             }
-            Event::ContextUsage(cu) => {
+            if let Some(pct) = fallback.context_usage_percentage {
                 let window = get_context_window_size(&model);
-                let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
+                let actual = (pct * (window as f64) / 100.0) as i32;
                 context_input_tokens = Some(actual);
-                if cu.context_usage_percentage >= 100.0 {
+                if pct >= 100.0 {
                     stop_reason_openai = "length".to_string();
                 }
             }
-            Event::Exception { exception_type, .. } => {
-                if exception_type == "ContentLengthExceededException" {
-                    stop_reason_openai = "length".to_string();
-                }
+            if context_input_tokens.is_none() {
+                context_input_tokens = fallback.input_tokens;
             }
-            _ => {}
+            upstream_output_tokens = fallback.output_tokens;
+        }
+    }
+
+    if !parsed_from_json {
+        for r in decoder.decode_iter() {
+            let Ok(frame) = r else { continue };
+            let Ok(event) = Event::from_frame(frame) else {
+                continue;
+            };
+            match event {
+                Event::AssistantResponse(resp) => text.push_str(&resp.content),
+                Event::ToolUse(tu) => {
+                    has_tool_use = true;
+                    let entry = tool_buffers
+                        .entry(tu.tool_use_id.clone())
+                        .or_insert_with(|| {
+                            tool_order.push(tu.tool_use_id.clone());
+                            let original_name = tool_name_map
+                                .get(&tu.name)
+                                .cloned()
+                                .unwrap_or(tu.name.clone());
+                            (original_name, String::new(), tu.tool_use_id.clone())
+                        });
+                    entry.1.push_str(&tu.input);
+                }
+                Event::ContextUsage(cu) => {
+                    let window = get_context_window_size(&model);
+                    let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
+                    context_input_tokens = Some(actual);
+                    if cu.context_usage_percentage >= 100.0 {
+                        stop_reason_openai = "length".to_string();
+                    }
+                }
+                Event::Exception { exception_type, .. } => {
+                    if exception_type == "ContentLengthExceededException" {
+                        stop_reason_openai = "length".to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if text.is_empty() && tool_calls.is_empty() {
+            if let Some(fallback) = parse_json_body_fallback(&body_bytes, &tool_name_map) {
+                text.push_str(&fallback.text_content);
+                if !fallback.tool_calls.is_empty() {
+                    has_tool_use = true;
+                    tool_calls = fallback.tool_calls;
+                }
+                if let Some(pct) = fallback.context_usage_percentage {
+                    let window = get_context_window_size(&model);
+                    let actual = (pct * (window as f64) / 100.0) as i32;
+                    context_input_tokens = Some(actual);
+                    if pct >= 100.0 {
+                        stop_reason_openai = "length".to_string();
+                    }
+                }
+                if context_input_tokens.is_none() {
+                    context_input_tokens = fallback.input_tokens;
+                }
+                upstream_output_tokens = fallback.output_tokens;
+            }
         }
     }
 
     // 构造 tool_calls（保持出现顺序）
-    for (idx, tool_use_id) in tool_order.iter().enumerate() {
-        if let Some((name, args, id)) = tool_buffers.remove(tool_use_id) {
-            let parsed: Value = if args.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&args).unwrap_or_else(|_| json!({}))
-            };
-            tool_calls.push(ChatResponseToolCall {
-                id,
-                r#type: "function",
-                function: ChatResponseFunction {
-                    name,
-                    arguments: serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_string()),
-                },
-                index: idx as i32,
-            });
+    if tool_calls.is_empty() {
+        for (idx, tool_use_id) in tool_order.iter().enumerate() {
+            if let Some((name, args, id)) = tool_buffers.remove(tool_use_id) {
+                let parsed: Value = if args.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str(&args).unwrap_or_else(|_| json!({}))
+                };
+                tool_calls.push(ChatResponseToolCall {
+                    id,
+                    r#type: "function",
+                    function: ChatResponseFunction {
+                        name,
+                        arguments: serde_json::to_string(&parsed)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                    index: idx as i32,
+                });
+            }
         }
     }
 
@@ -677,7 +1006,8 @@ async fn handle_non_stream(
     let (_, visible_text) = super::stream::extract_thinking_from_complete_text(&text);
 
     let output_content = [json!({"type":"text","text":visible_text})];
-    let output_tokens = token::estimate_output_tokens(&output_content);
+    let output_tokens =
+        upstream_output_tokens.unwrap_or_else(|| token::estimate_output_tokens(&output_content));
     let input_tokens = context_input_tokens.unwrap_or(estimated_input_tokens);
 
     let completion = ChatCompletion {
@@ -727,9 +1057,64 @@ async fn handle_stream(
         Ok(r) => r,
         Err(e) => return map_provider_error(e, Some(&request_body)),
     };
+    let prefer_json_fallback = response_content_type_is_json(&response);
 
     let id = format!("chatcmpl-{}", Uuid::new_v4().to_string().replace('-', ""));
     let created = chrono_now_secs();
+
+    if prefer_json_fallback {
+        let body_bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("读取响应失败: {}", e),
+                    )),
+                )
+                    .into_response();
+            }
+        };
+
+        if let Some(fallback) = parse_json_body_fallback(&body_bytes, &tool_name_map) {
+            let prompt_tokens = fallback
+                .context_usage_percentage
+                .map(|pct| (pct * (get_context_window_size(&model) as f64) / 100.0) as i32)
+                .or(fallback.input_tokens)
+                .unwrap_or(estimated_input_tokens);
+            let completion_tokens = fallback.output_tokens.unwrap_or_else(|| {
+                let output_content = [json!({"type":"text","text":fallback.text_content})];
+                token::estimate_output_tokens(&output_content)
+            });
+            let chunks = build_openai_fallback_sse_chunks(
+                &id,
+                created,
+                &model,
+                &fallback,
+                prompt_tokens,
+                completion_tokens,
+            );
+            let bytes: Vec<Result<Bytes, Infallible>> =
+                chunks.into_iter().map(|s| Ok(Bytes::from(s))).collect();
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CONNECTION, "keep-alive")
+                .body(Body::from_stream(stream::iter(bytes)))
+                .unwrap();
+        }
+
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                "上游返回了 JSON 响应，但无法解析为 OpenAI 流式回退格式。",
+            )),
+        )
+            .into_response();
+    }
 
     let stream = create_openai_sse_stream(
         response,
@@ -747,6 +1132,92 @@ async fn handle_stream(
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+fn build_openai_fallback_sse_chunks(
+    id: &str,
+    created: i64,
+    model: &str,
+    fallback: &OpenAiJsonBodyFallback,
+    prompt_tokens: i32,
+    completion_tokens: i32,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let wrap = |choices: Value| {
+        format!(
+            "data: {}\n\n",
+            serde_json::to_string(&json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": choices,
+            }))
+            .unwrap_or_else(|_| "{}".to_string())
+        )
+    };
+
+    out.push(wrap(json!([
+        {"index":0, "delta": {"role":"assistant", "content":""}, "finish_reason": null}
+    ])));
+
+    if !fallback.text_content.is_empty() {
+        out.push(wrap(json!([
+            {"index":0, "delta": {"content": fallback.text_content}, "finish_reason": null}
+        ])));
+    }
+
+    if !fallback.tool_calls.is_empty() {
+        let tool_calls = fallback
+            .tool_calls
+            .iter()
+            .map(|tool_call| {
+                json!({
+                    "index": tool_call.index,
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        out.push(wrap(json!([
+            {"index":0, "delta": {"tool_calls": tool_calls}, "finish_reason": null}
+        ])));
+    }
+
+    let finish_reason = if !fallback.tool_calls.is_empty() {
+        "tool_calls"
+    } else if fallback.context_usage_percentage.unwrap_or_default() >= 100.0 {
+        "length"
+    } else {
+        "stop"
+    };
+
+    out.push(format!(
+        "data: {}\n\n",
+        serde_json::to_string(&json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }))
+        .unwrap_or_else(|_| "{}".to_string())
+    ));
+    out.push("data: [DONE]\n\n".to_string());
+    out
 }
 
 struct OpenAIStreamState {
@@ -1073,7 +1544,11 @@ mod tests {
         message
             .content
             .as_array()
-            .and_then(|blocks| blocks.iter().find(|block| block.get("type") == Some(&Value::String("tool_use".to_string()))))
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|block| block.get("type") == Some(&Value::String("tool_use".to_string())))
+            })
             .and_then(|block| block.get("id"))
             .and_then(|id| id.as_str())
             .expect("assistant message should contain tool_use id")
@@ -1084,7 +1559,11 @@ mod tests {
         message
             .content
             .as_array()
-            .and_then(|blocks| blocks.iter().find(|block| block.get("type") == Some(&Value::String("tool_result".to_string()))))
+            .and_then(|blocks| {
+                blocks.iter().find(|block| {
+                    block.get("type") == Some(&Value::String("tool_result".to_string()))
+                })
+            })
             .and_then(|block| block.get("tool_use_id"))
             .and_then(|id| id.as_str())
             .expect("user message should contain tool_result id")
@@ -1177,5 +1656,95 @@ mod tests {
         assert_ne!(first_tool_use_id, second_tool_use_id);
         assert!(first_tool_use_id.starts_with("toolu_"));
         assert!(second_tool_use_id.starts_with("toolu_"));
+    }
+
+    #[test]
+    fn test_parse_json_body_fallback_extracts_openai_usage_and_text() {
+        let body = serde_json::to_vec(&json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "修订后的第一章正文"
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 4259,
+                "completion_tokens": 472,
+                "total_tokens": 4731
+            }
+        }))
+        .expect("json body");
+
+        let fallback =
+            parse_json_body_fallback(&body, &std::collections::HashMap::new()).expect("fallback");
+
+        assert_eq!(fallback.text_content, "修订后的第一章正文");
+        assert_eq!(fallback.input_tokens, Some(4259));
+        assert_eq!(fallback.output_tokens, Some(472));
+    }
+
+    #[test]
+    fn test_parse_json_body_fallback_extracts_tool_use_blocks() {
+        let mut tool_name_map = std::collections::HashMap::new();
+        tool_name_map.insert("fs_write".to_string(), "Write".to_string());
+        let body = serde_json::to_vec(&json!({
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "fs_write",
+                    "input": {
+                        "path": "chapter1.md",
+                        "command": "create",
+                        "file_text": "正文"
+                    }
+                }
+            ],
+            "usage": {
+                "output_tokens": 64
+            }
+        }))
+        .expect("json body");
+
+        let fallback = parse_json_body_fallback(&body, &tool_name_map).expect("fallback");
+
+        assert_eq!(fallback.output_tokens, Some(64));
+        assert_eq!(fallback.tool_calls.len(), 1);
+        assert_eq!(fallback.tool_calls[0].id, "toolu_123");
+        assert_eq!(fallback.tool_calls[0].function.name, "Write");
+        assert_eq!(
+            fallback.tool_calls[0].function.arguments,
+            r#"{"command":"create","file_text":"正文","path":"chapter1.md"}"#
+        );
+    }
+
+    #[test]
+    fn test_build_openai_fallback_sse_chunks_carries_usage() {
+        let fallback = OpenAiJsonBodyFallback {
+            text_content: "修订后的完整正文".to_string(),
+            tool_calls: Vec::new(),
+            context_usage_percentage: None,
+            input_tokens: Some(4259),
+            output_tokens: Some(472),
+        };
+
+        let chunks = build_openai_fallback_sse_chunks(
+            "chatcmpl_test",
+            123,
+            "glm-5",
+            &fallback,
+            4259,
+            472,
+        );
+
+        assert_eq!(chunks.last().map(String::as_str), Some("data: [DONE]\n\n"));
+        let final_payload = chunks
+            .iter()
+            .rev()
+            .find(|chunk| chunk.contains("\"usage\""))
+            .expect("final chunk with usage");
+        assert!(final_payload.contains("\"completion_tokens\":472"));
+        assert!(final_payload.contains("\"prompt_tokens\":4259"));
     }
 }
