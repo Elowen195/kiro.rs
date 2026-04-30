@@ -31,10 +31,6 @@ export function CredentialSettingsDialog({
   onOpenChange,
 }: CredentialSettingsDialogProps) {
   const [priority, setPriority] = useState('0')
-  const [authRegion, setAuthRegion] = useState('')
-  const [apiRegion, setApiRegion] = useState('')
-  const [machineId, setMachineId] = useState('')
-  const [endpoint, setEndpoint] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
@@ -45,10 +41,6 @@ export function CredentialSettingsDialog({
   useEffect(() => {
     if (!credential || !open) return
     setPriority(String(credential.priority))
-    setAuthRegion(credential.authRegion ?? '')
-    setApiRegion(credential.apiRegion ?? '')
-    setMachineId(credential.machineId ?? '')
-    setEndpoint(credential.configuredEndpoint ?? '')
     setProxyUrl(credential.proxyUrl ?? '')
     setProxyUsername(credential.proxyUsername ?? '')
     setProxyPassword('')
@@ -70,10 +62,10 @@ export function CredentialSettingsDialog({
         id: credential.id,
         payload: {
           priority: parsedPriority,
-          authRegion: normalizeText(authRegion),
-          apiRegion: normalizeText(apiRegion),
-          machineId: normalizeText(machineId),
-          endpoint: normalizeText(endpoint),
+          authRegion: credential.authRegion,
+          apiRegion: credential.apiRegion,
+          machineId: credential.machineId,
+          endpoint: credential.configuredEndpoint,
           proxyUrl: normalizeText(proxyUrl),
           proxyUsername: normalizeText(proxyUsername),
           proxyPassword: clearProxyPassword ? '' : normalizeText(proxyPassword),
@@ -97,9 +89,9 @@ export function CredentialSettingsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
+      <DialogContent className="sm:max-w-md max-h-[85vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>凭据设置 #{credential.id}</DialogTitle>
+          <DialogTitle>代理设置 #{credential.id}</DialogTitle>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
@@ -119,51 +111,8 @@ export function CredentialSettingsDialog({
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">Region</label>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                <Input
-                  placeholder="Auth Region"
-                  value={authRegion}
-                  onChange={(e) => setAuthRegion(e.target.value)}
-                  disabled={disabled}
-                />
-                <Input
-                  placeholder="API Region"
-                  value={apiRegion}
-                  onChange={(e) => setApiRegion(e.target.value)}
-                  disabled={disabled}
-                />
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <label htmlFor={`credential-${credential.id}-machine-id`} className="text-sm font-medium">
-                Machine ID
-              </label>
-              <Input
-                id={`credential-${credential.id}-machine-id`}
-                value={machineId}
-                onChange={(e) => setMachineId(e.target.value)}
-                disabled={disabled}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label htmlFor={`credential-${credential.id}-endpoint`} className="text-sm font-medium">
-                端点
-              </label>
-              <Input
-                id={`credential-${credential.id}-endpoint`}
-                placeholder="ide / cli"
-                value={endpoint}
-                onChange={(e) => setEndpoint(e.target.value)}
-                disabled={disabled}
-              />
-            </div>
-
-            <div className="space-y-2">
               <label htmlFor={`credential-${credential.id}-proxy-url`} className="text-sm font-medium">
-                代理
+                代理 URL
               </label>
               <Input
                 id={`credential-${credential.id}-proxy-url`}

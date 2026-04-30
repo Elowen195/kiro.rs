@@ -345,10 +345,10 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={() => setShowSettingsDialog(true)}
-              title="设置凭据"
+              title="设置代理和优先级"
             >
               <Settings className="h-4 w-4 mr-1" />
-              设置
+              代理设置
             </Button>
             <Button
               size="sm"
