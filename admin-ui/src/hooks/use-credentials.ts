@@ -8,10 +8,11 @@ import {
   getCredentialBalance,
   addCredential,
   deleteCredential,
+  updateCredentialSettings,
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, UpdateCredentialSettingsRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -50,6 +51,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 更新凭据设置
+export function useUpdateCredentialSettings() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: UpdateCredentialSettingsRequest }) =>
+      updateCredentialSettings(id, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

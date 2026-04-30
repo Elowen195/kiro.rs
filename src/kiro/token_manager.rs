@@ -558,6 +558,10 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// 当前 access token 周期内是否已尝试过同步缺失的 profileArn
     profile_arn_sync_attempted: bool,
+    /// 瞬态上游错误冷却截止时间
+    cooldown_until: Option<DateTime<Utc>>,
+    /// 最近一次影响健康状态的错误
+    last_error: Option<String>,
 }
 
 /// 禁用原因
@@ -633,6 +637,24 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 凭据级 Auth Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    /// 凭据级 API Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    /// 凭据级 Machine ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// 代理用户名（用于设置表单回填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    /// 瞬态冷却截止时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    /// 最近一次影响健康状态的错误
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -676,10 +698,35 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 瞬态错误基础冷却时间
+const TRANSIENT_COOLDOWN_BASE_SECS: i64 = 30;
+/// 瞬态错误最大冷却时间
+const TRANSIENT_COOLDOWN_MAX_SECS: i64 = 5 * 60;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 const US_EASTERN_STANDARD_OFFSET_SECS: i32 = 5 * 60 * 60;
 const US_EASTERN_DAYLIGHT_OFFSET_SECS: i32 = 4 * 60 * 60;
+
+fn is_cooling_down(entry: &CredentialEntry, now: DateTime<Utc>) -> bool {
+    entry
+        .cooldown_until
+        .as_ref()
+        .is_some_and(|cooldown_until| *cooldown_until > now)
+}
+
+fn is_entry_available(entry: &CredentialEntry, now: DateTime<Utc>) -> bool {
+    !entry.disabled && !is_cooling_down(entry, now)
+}
+
+fn has_available_entry(entries: &[CredentialEntry], now: DateTime<Utc>) -> bool {
+    entries.iter().any(|e| is_entry_available(e, now))
+}
+
+fn transient_cooldown_duration(failure_count: u32) -> Duration {
+    let multiplier = 1_i64 << failure_count.saturating_sub(1).min(8);
+    let secs = (TRANSIENT_COOLDOWN_BASE_SECS * multiplier).min(TRANSIENT_COOLDOWN_MAX_SECS);
+    Duration::seconds(secs)
+}
 
 /// API 调用上下文
 ///
@@ -693,6 +740,19 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+}
+
+/// Admin API 可更新的凭据设置。
+pub struct CredentialSettingsUpdate {
+    pub priority: u32,
+    pub auth_region: Option<String>,
+    pub api_region: Option<String>,
+    pub machine_id: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    /// None 表示保持原密码；Some(empty) 表示清空；Some(non-empty) 表示设置新值。
+    pub proxy_password: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 /// 本轮瞬态错误避让已覆盖所有候选凭据。
@@ -763,6 +823,8 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     profile_arn_sync_attempted: false,
+                    cooldown_until: None,
+                    last_error: None,
                 }
             })
             .collect();
@@ -849,7 +911,12 @@ impl MultiTokenManager {
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         self.auto_recover_quota_exhausted_entries_if_due();
-        self.entries.lock().iter().filter(|e| !e.disabled).count()
+        let now = Utc::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| is_entry_available(e, now))
+            .count()
     }
 
     fn nth_weekday_of_month(year: i32, month: u32, weekday: Weekday, nth: u32) -> NaiveDate {
@@ -948,6 +1015,8 @@ impl MultiTokenManager {
                     entry.disabled_reason = None;
                     entry.failure_count = 0;
                     entry.refresh_failure_count = 0;
+                    entry.cooldown_until = None;
+                    entry.last_error = None;
                     recovered.push(entry.id);
                 }
             }
@@ -978,6 +1047,7 @@ impl MultiTokenManager {
         excluded_ids: Option<&HashSet<u64>>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
+        let now = Utc::now();
 
         // 检查是否是 opus 模型
         let is_opus = model
@@ -988,7 +1058,7 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
-                if e.disabled {
+                if !is_entry_available(e, now) {
                     return false;
                 }
                 if excluded_ids.is_some_and(|ids| ids.contains(&e.id)) {
@@ -1079,11 +1149,12 @@ impl MultiTokenManager {
                 } else {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
+                    let now = Utc::now();
                     entries
                         .iter()
                         .find(|e| {
                             e.id == current_id
-                                && !e.disabled
+                                && is_entry_available(e, now)
                                 && !excluded_ids.is_some_and(|ids| ids.contains(&e.id))
                         })
                         .map(|e| (e.id, e.credentials.clone()))
@@ -1133,8 +1204,12 @@ impl MultiTokenManager {
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        let now = Utc::now();
+                        let available = entries
+                            .iter()
+                            .filter(|e| is_entry_available(e, now))
+                            .count();
+                        anyhow::bail!("所有凭据均不可用（{}/{}）", available, total);
                     }
                 }
             };
@@ -1171,11 +1246,12 @@ impl MultiTokenManager {
     fn select_highest_priority(&self) {
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
+        let now = Utc::now();
 
         // 选择优先级最高的未禁用凭据（不排除当前凭据）
         if let Some(best) = entries
             .iter()
-            .filter(|e| !e.disabled)
+            .filter(|e| is_entry_available(e, now))
             .min_by_key(|e| e.credentials.priority)
         {
             if best.id != *current_id {
@@ -1483,6 +1559,8 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.cooldown_until = None;
+                entry.last_error = None;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1493,6 +1571,65 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 报告指定凭据遭遇可恢复的上游/链路瞬态失败。
+    ///
+    /// 不禁用凭据，只设置短冷却并切换到其他可用凭据，避免单账号/单 IP 连续撞同一个异常上游。
+    pub fn report_transient_failure(&self, id: u64, reason: impl Into<String>) -> bool {
+        let reason = reason.into().chars().take(500).collect::<String>();
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+            let now = Utc::now();
+            let now_string = now.to_rfc3339();
+
+            let (failure_count, cooldown_until) = {
+                let entry = match entries.iter_mut().find(|e| e.id == id) {
+                    Some(e) => e,
+                    None => return has_available_entry(&entries, now),
+                };
+
+                if entry.disabled {
+                    return has_available_entry(&entries, now);
+                }
+
+                entry.failure_count = entry.failure_count.saturating_add(1);
+                entry.last_used_at = Some(now_string);
+                entry.last_error = Some(reason.clone());
+                let cooldown_until = now + transient_cooldown_duration(entry.failure_count);
+                entry.cooldown_until = Some(cooldown_until);
+
+                (entry.failure_count, cooldown_until)
+            };
+
+            tracing::warn!(
+                "凭据 #{} 遭遇瞬态失败，冷却至 {}（失败计数 {}）: {}",
+                id,
+                cooldown_until.to_rfc3339(),
+                failure_count,
+                reason
+            );
+
+            if *current_id == id {
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| is_entry_available(e, now))
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                }
+            }
+
+            has_available_entry(&entries, now)
+        };
+        self.save_stats_debounced();
+        result
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1506,18 +1643,21 @@ impl MultiTokenManager {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
+            let now = Utc::now();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return has_available_entry(&entries, now),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return has_available_entry(&entries, now);
             }
 
             entry.failure_count += 1;
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.last_used_at = Some(now.to_rfc3339());
+            entry.cooldown_until = None;
+            entry.last_error = Some("credential_error".to_string());
             let failure_count = entry.failure_count;
 
             tracing::warn!(
@@ -1535,7 +1675,7 @@ impl MultiTokenManager {
                 // 切换到优先级最高的可用凭据
                 if let Some(next) = entries
                     .iter()
-                    .filter(|e| !e.disabled)
+                    .filter(|e| is_entry_available(e, now))
                     .min_by_key(|e| e.credentials.priority)
                 {
                     *current_id = next.id;
@@ -1549,7 +1689,7 @@ impl MultiTokenManager {
                 }
             }
 
-            entries.iter().any(|e| !e.disabled)
+            has_available_entry(&entries, now)
         };
         self.save_stats_debounced();
         result
@@ -1565,19 +1705,22 @@ impl MultiTokenManager {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
+            let now = Utc::now();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return has_available_entry(&entries, now),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return has_available_entry(&entries, now);
             }
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.last_used_at = Some(now.to_rfc3339());
+            entry.cooldown_until = None;
+            entry.last_error = Some("quota_exhausted".to_string());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
@@ -1586,7 +1729,7 @@ impl MultiTokenManager {
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|e| is_entry_available(e, now))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -1612,19 +1755,22 @@ impl MultiTokenManager {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
+            let now = Utc::now();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return has_available_entry(&entries, now),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return has_available_entry(&entries, now);
             }
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::Suspended);
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.last_used_at = Some(now.to_rfc3339());
+            entry.cooldown_until = None;
+            entry.last_error = Some("temporarily_suspended".to_string());
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
             tracing::error!(
@@ -1634,7 +1780,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|e| is_entry_available(e, now))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -1661,17 +1807,19 @@ impl MultiTokenManager {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
+            let now = Utc::now();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return has_available_entry(&entries, now),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return has_available_entry(&entries, now);
             }
 
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.last_used_at = Some(now.to_rfc3339());
+            entry.last_error = Some("refresh_token_failed".to_string());
             entry.refresh_failure_count += 1;
             let refresh_failure_count = entry.refresh_failure_count;
 
@@ -1683,11 +1831,12 @@ impl MultiTokenManager {
             );
 
             if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                return entries.iter().any(|e| !e.disabled);
+                return has_available_entry(&entries, now);
             }
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            entry.cooldown_until = None;
 
             tracing::error!(
                 "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
@@ -1697,7 +1846,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|e| is_entry_available(e, now))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -1724,19 +1873,22 @@ impl MultiTokenManager {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
+            let now = Utc::now();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return has_available_entry(&entries, now),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return has_available_entry(&entries, now);
             }
 
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.last_used_at = Some(now.to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            entry.cooldown_until = None;
+            entry.last_error = Some("invalid_refresh_token".to_string());
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -1745,7 +1897,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|e| is_entry_available(e, now))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -1770,11 +1922,12 @@ impl MultiTokenManager {
     pub fn switch_to_next(&self) -> bool {
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
+        let now = Utc::now();
 
         // 选择优先级最高的未禁用凭据（排除当前凭据）
         if let Some(next) = entries
             .iter()
-            .filter(|e| !e.disabled && e.id != *current_id)
+            .filter(|e| is_entry_available(e, now) && e.id != *current_id)
             .min_by_key(|e| e.credentials.priority)
         {
             *current_id = next.id;
@@ -1786,7 +1939,9 @@ impl MultiTokenManager {
             true
         } else {
             // 没有其他可用凭据，检查当前凭据是否可用
-            entries.iter().any(|e| e.id == *current_id && !e.disabled)
+            entries
+                .iter()
+                .any(|e| e.id == *current_id && is_entry_available(e, now))
         }
     }
 
@@ -1799,7 +1954,11 @@ impl MultiTokenManager {
         self.auto_recover_quota_exhausted_entries_if_due();
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
-        let available = entries.iter().filter(|e| !e.disabled).count();
+        let now = Utc::now();
+        let available = entries
+            .iter()
+            .filter(|e| is_entry_available(e, now))
+            .count();
 
         ManagerSnapshot {
             entries: entries
@@ -1861,6 +2020,12 @@ impl MultiTokenManager {
                         .to_string()
                     }),
                     endpoint: e.credentials.endpoint.clone(),
+                    auth_region: e.credentials.auth_region.clone(),
+                    api_region: e.credentials.api_region.clone(),
+                    machine_id: e.credentials.machine_id.clone(),
+                    proxy_username: e.credentials.proxy_username.clone(),
+                    cooldown_until: e.cooldown_until.as_ref().map(|t| t.to_rfc3339()),
+                    last_error: e.last_error.clone(),
                 })
                 .collect(),
             current_id,
@@ -1883,8 +2048,12 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
+                entry.cooldown_until = None;
+                entry.last_error = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
+                entry.cooldown_until = None;
+                entry.last_error = None;
             }
         }
         // 持久化更改
@@ -1912,6 +2081,62 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 更新凭据的可调配置（Admin API）
+    pub fn update_credential_settings(
+        &self,
+        id: u64,
+        update: CredentialSettingsUpdate,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            entry.credentials.priority = update.priority;
+            entry.credentials.auth_region = update.auth_region;
+            entry.credentials.api_region = update.api_region;
+            entry.credentials.machine_id = update.machine_id;
+            entry.credentials.endpoint = update.endpoint;
+
+            match update.proxy_url {
+                Some(proxy_url) => {
+                    if proxy_url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                        entry.credentials.proxy_url =
+                            Some(KiroCredentials::PROXY_DIRECT.to_string());
+                        entry.credentials.proxy_username = None;
+                        entry.credentials.proxy_password = None;
+                    } else {
+                        entry.credentials.proxy_url = Some(proxy_url);
+                        entry.credentials.proxy_username = update.proxy_username;
+                        if let Some(password) = update.proxy_password {
+                            entry.credentials.proxy_password = if password.is_empty() {
+                                None
+                            } else {
+                                Some(password)
+                            };
+                        }
+                    }
+                }
+                None => {
+                    entry.credentials.proxy_url = None;
+                    entry.credentials.proxy_username = None;
+                    entry.credentials.proxy_password = None;
+                }
+            }
+
+            entry.failure_count = 0;
+            entry.refresh_failure_count = 0;
+            entry.cooldown_until = None;
+            entry.last_error = None;
+        }
+
+        self.select_highest_priority();
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -1927,6 +2152,8 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            entry.cooldown_until = None;
+            entry.last_error = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -2165,6 +2392,8 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                cooldown_until: None,
+                last_error: None,
             });
         }
 
@@ -2271,6 +2500,8 @@ impl MultiTokenManager {
                 entry.profile_arn_sync_attempted = new_creds.profile_arn.is_none();
                 entry.credentials = new_creds;
                 entry.refresh_failure_count = 0;
+                entry.cooldown_until = None;
+                entry.last_error = None;
             }
         }
 
@@ -2434,8 +2665,7 @@ mod tests {
 
     #[test]
     fn test_is_builder_id_profile_resolution_unsupported() {
-        let body =
-            r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"AWS Builder ID is not supported for this operation."}"#;
+        let body = r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"AWS Builder ID is not supported for this operation."}"#;
         assert!(is_builder_id_profile_resolution_unsupported(
             reqwest::StatusCode::FORBIDDEN,
             body
@@ -2841,6 +3071,94 @@ mod tests {
         assert_eq!(next.token, "token-2");
     }
 
+    #[tokio::test]
+    async fn test_multi_token_manager_transient_failure_cools_down_and_switches() {
+        let config = Config::default();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.priority = 0;
+        cred1.access_token = Some("token-1".to_string());
+        cred1.profile_arn = Some("arn:aws:test:token-1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.priority = 1;
+        cred2.access_token = Some("token-2".to_string());
+        cred2.profile_arn = Some("arn:aws:test:token-2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+
+        assert!(manager.report_transient_failure(1, "upstream timeout"));
+        assert_eq!(manager.available_count(), 1);
+
+        let snapshot = manager.snapshot();
+        let cooled = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(cooled.failure_count, 1);
+        assert!(cooled.cooldown_until.is_some());
+        assert_eq!(cooled.last_error.as_deref(), Some("upstream timeout"));
+        assert_eq!(snapshot.current_id, 2);
+
+        let next = manager.acquire_context(None).await.unwrap();
+        assert_eq!(next.id, 2);
+
+        manager.report_success(1);
+        let snapshot = manager.snapshot();
+        let recovered = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(recovered.failure_count, 0);
+        assert!(recovered.cooldown_until.is_none());
+        assert!(recovered.last_error.is_none());
+    }
+
+    #[test]
+    fn test_update_credential_settings_updates_proxy_and_clears_health() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.priority = 9;
+        cred.proxy_url = Some("http://old-proxy:8080".to_string());
+        cred.proxy_username = Some("old-user".to_string());
+        cred.proxy_password = Some("old-pass".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        assert!(!manager.report_transient_failure(1, "connection reset"));
+
+        manager
+            .update_credential_settings(
+                1,
+                CredentialSettingsUpdate {
+                    priority: 2,
+                    auth_region: Some("us-east-1".to_string()),
+                    api_region: Some("us-west-2".to_string()),
+                    machine_id: Some("machine-1".to_string()),
+                    proxy_url: Some(KiroCredentials::PROXY_DIRECT.to_string()),
+                    proxy_username: Some("ignored".to_string()),
+                    proxy_password: Some("ignored".to_string()),
+                    endpoint: Some("cli".to_string()),
+                },
+            )
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(entry.priority, 2);
+        assert_eq!(entry.auth_region.as_deref(), Some("us-east-1"));
+        assert_eq!(entry.api_region.as_deref(), Some("us-west-2"));
+        assert_eq!(entry.machine_id.as_deref(), Some("machine-1"));
+        assert_eq!(
+            entry.proxy_url.as_deref(),
+            Some(KiroCredentials::PROXY_DIRECT)
+        );
+        assert!(entry.proxy_username.is_none());
+        assert_eq!(entry.endpoint.as_deref(), Some("cli"));
+        assert_eq!(entry.failure_count, 0);
+        assert!(entry.cooldown_until.is_none());
+        assert!(entry.last_error.is_none());
+    }
+
     #[test]
     fn test_multi_token_manager_report_refresh_failure() {
         let config = Config::default();
@@ -2888,8 +3206,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
+            err.contains("所有凭据均不可用"),
+            "错误应提示所有凭据不可用，实际: {}",
             err
         );
     }
@@ -2954,8 +3272,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
+            err.contains("所有凭据均不可用"),
+            "错误应提示所有凭据不可用，实际: {}",
             err
         );
         assert_eq!(manager.available_count(), 0);

@@ -24,9 +24,16 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  proxyUsername?: string
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  configuredEndpoint?: string
+  authRegion?: string
+  apiRegion?: string
+  machineId?: string
+  cooldownUntil?: string
+  lastError?: string
 }
 
 // 余额响应
@@ -61,6 +68,17 @@ export interface SetDisabledRequest {
 
 export interface SetPriorityRequest {
   priority: number
+}
+
+export interface UpdateCredentialSettingsRequest {
+  priority: number
+  authRegion?: string
+  apiRegion?: string
+  machineId?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  endpoint?: string
 }
 
 // 添加凭据请求

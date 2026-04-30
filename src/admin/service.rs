@@ -9,16 +9,23 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialSettingsUpdate, MultiTokenManager};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    UpdateCredentialSettingsRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,26 +74,36 @@ impl AdminService {
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                success_count: entry.success_count,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+            .map(|entry| {
+                let configured_endpoint = entry.endpoint.clone();
+                CredentialStatusItem {
+                    id: entry.id,
+                    priority: entry.priority,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    success_count: entry.success_count,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url,
+                    proxy_username: entry.proxy_username,
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    configured_endpoint,
+                    auth_region: entry.auth_region,
+                    api_region: entry.api_region,
+                    machine_id: entry.machine_id,
+                    cooldown_until: entry.cooldown_until,
+                    last_error: entry.last_error,
+                }
             })
             .collect();
 
@@ -122,6 +139,41 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 更新凭据设置
+    pub fn update_credential_settings(
+        &self,
+        id: u64,
+        req: UpdateCredentialSettingsRequest,
+    ) -> Result<(), AdminServiceError> {
+        let endpoint = normalize_optional_string(req.endpoint);
+        if let Some(ref name) = endpoint {
+            if !self.known_endpoints.contains(name) {
+                let mut known: Vec<&str> =
+                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                known.sort();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{}\"，已注册端点: {:?}",
+                    name, known
+                )));
+            }
+        }
+
+        let update = CredentialSettingsUpdate {
+            priority: req.priority,
+            auth_region: normalize_optional_string(req.auth_region),
+            api_region: normalize_optional_string(req.api_region),
+            machine_id: normalize_optional_string(req.machine_id),
+            proxy_url: normalize_optional_string(req.proxy_url),
+            proxy_username: normalize_optional_string(req.proxy_username),
+            proxy_password: req.proxy_password.map(|s| s.trim().to_string()),
+            endpoint,
+        };
+
+        self.token_manager
+            .update_credential_settings(id, update)
             .map_err(|e| self.classify_error(e, id))
     }
 

@@ -1053,10 +1053,12 @@ async fn handle_stream(
     estimated_input_tokens: i32,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
-    let response = match provider.call_api_stream(&request_body).await {
+    let upstream = match provider.call_api_stream(&request_body).await {
         Ok(r) => r,
         Err(e) => return map_provider_error(e, Some(&request_body)),
     };
+    let credential_id = upstream.credential_id;
+    let response = upstream.response;
     let prefer_json_fallback = response_content_type_is_json(&response);
 
     let id = format!("chatcmpl-{}", Uuid::new_v4().to_string().replace('-', ""));
@@ -1066,6 +1068,7 @@ async fn handle_stream(
         let body_bytes = match response.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                provider.report_stream_failure(credential_id, e.to_string());
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(ErrorResponse::new(
@@ -1078,6 +1081,7 @@ async fn handle_stream(
         };
 
         if let Some(fallback) = parse_json_body_fallback(&body_bytes, &tool_name_map) {
+            provider.report_stream_success(credential_id);
             let prompt_tokens = fallback
                 .context_usage_percentage
                 .map(|pct| (pct * (get_context_window_size(&model) as f64) / 100.0) as i32)
@@ -1106,6 +1110,7 @@ async fn handle_stream(
                 .unwrap();
         }
 
+        provider.report_stream_failure(credential_id, "OpenAI JSON fallback parse failed");
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -1123,6 +1128,8 @@ async fn handle_stream(
         model,
         estimated_input_tokens,
         tool_name_map,
+        provider,
+        credential_id,
     );
 
     Response::builder()
@@ -1418,6 +1425,8 @@ fn create_openai_sse_stream(
     model: String,
     input_tokens: i32,
     tool_name_map: std::collections::HashMap<String, String>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    credential_id: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let state = OpenAIStreamState::new(id, created, model, input_tokens, tool_name_map);
     let body_stream = response.bytes_stream();
@@ -1429,8 +1438,18 @@ fn create_openai_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            provider,
+            credential_id,
         ),
-        |(mut body_stream, mut state, mut decoder, finished, mut ping_interval)| async move {
+        |(
+            mut body_stream,
+            mut state,
+            mut decoder,
+            finished,
+            mut ping_interval,
+            provider,
+            credential_id,
+        )| async move {
             if finished {
                 return None;
             }
@@ -1450,31 +1469,33 @@ fn create_openai_sse_stream(
                                 .into_iter()
                                 .map(|s| Ok(Bytes::from(s)))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, state, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, state, decoder, false, ping_interval, provider, credential_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("OpenAI 流读取失败: {}", e);
+                            provider.report_stream_failure(credential_id, e.to_string());
                             let final_strings = state.final_chunks();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_strings
                                 .into_iter()
                                 .map(|s| Ok(Bytes::from(s)))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, state, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, state, decoder, true, ping_interval, provider, credential_id)))
                         }
                         None => {
+                            provider.report_stream_success(credential_id);
                             let final_strings = state.final_chunks();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_strings
                                 .into_iter()
                                 .map(|s| Ok(Bytes::from(s)))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, state, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, state, decoder, true, ping_interval, provider, credential_id)))
                         }
                     }
                 }
                 _ = ping_interval.tick() => {
                     // OpenAI 兼容：发送 SSE comment 保活（不影响客户端）
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(": keep-alive\n\n"))];
-                    Some((stream::iter(bytes), (body_stream, state, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, state, decoder, false, ping_interval, provider, credential_id)))
                 }
             }
         },

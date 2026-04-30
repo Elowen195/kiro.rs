@@ -6,6 +6,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  UpdateCredentialSettingsRequest,
   AddCredentialRequest,
   AddCredentialResponse,
 } from '@/types/api'
@@ -54,6 +55,15 @@ export async function setCredentialPriority(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
   )
+  return data
+}
+
+// 更新凭据设置
+export async function updateCredentialSettings(
+  id: number,
+  req: UpdateCredentialSettingsRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(`/credentials/${id}/settings`, req)
   return data
 }
 

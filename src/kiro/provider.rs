@@ -60,6 +60,12 @@ pub struct KiroProvider {
     default_endpoint: String,
 }
 
+/// 流式 API 响应及其绑定的凭据 ID。
+pub struct KiroStreamResponse {
+    pub credential_id: u64,
+    pub response: reqwest::Response,
+}
+
 fn is_truthy_env(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -327,12 +333,28 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        let (_, response) = self.call_api_with_retry(request_body, false).await?;
+        Ok(response)
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
+        let (credential_id, response) = self.call_api_with_retry(request_body, true).await?;
+        Ok(KiroStreamResponse {
+            credential_id,
+            response,
+        })
+    }
+
+    /// 上游流完整结束后再记录成功，避免刚拿到 HTTP 200 就把中途断流算成功。
+    pub fn report_stream_success(&self, credential_id: u64) {
+        self.token_manager.report_success(credential_id);
+    }
+
+    /// 上游流中途失败时记录瞬态冷却。
+    pub fn report_stream_failure(&self, credential_id: u64, reason: impl Into<String>) -> bool {
+        self.token_manager
+            .report_transient_failure(credential_id, reason)
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -557,7 +579,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(u64, reqwest::Response)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -660,9 +682,11 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
+                    transient_avoided_ids.insert(ctx.id);
+                    let reason = e.to_string();
+                    self.token_manager
+                        .report_transient_failure(ctx.id, reason.clone());
+                    last_error = Some(anyhow::anyhow!(reason));
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -675,8 +699,10 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                if !is_stream {
+                    self.token_manager.report_success(ctx.id);
+                }
+                return Ok((ctx.id, response));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -943,6 +969,10 @@ impl KiroProvider {
                     status,
                     body
                 );
+                self.token_manager.report_transient_failure(
+                    ctx.id,
+                    format!("{} API 请求瞬态失败: {} {}", api_type, status, body),
+                );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -1003,6 +1033,11 @@ impl KiroProvider {
                 max_retries,
                 status,
                 body
+            );
+            transient_avoided_ids.insert(ctx.id);
+            self.token_manager.report_transient_failure(
+                ctx.id,
+                format!("{} API 请求未知失败: {} {}", api_type, status, body),
             );
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",

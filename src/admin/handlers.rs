@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        SuccessResponse, UpdateCredentialSettingsRequest,
     },
 };
 
@@ -50,6 +50,19 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/credentials/:id/settings
+/// 更新凭据设置
+pub async fn update_credential_settings(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateCredentialSettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.update_credential_settings(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 设置已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

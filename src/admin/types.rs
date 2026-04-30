@@ -55,6 +55,9 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 代理用户名（用于前端设置回填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -62,6 +65,24 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 凭据中显式配置的端点名称；None 表示使用全局默认端点
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_endpoint: Option<String>,
+    /// 凭据级 Auth Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    /// 凭据级 API Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    /// 凭据级 Machine ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// 瞬态冷却截止时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    /// 最近一次影响健康状态的错误
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -80,6 +101,28 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 更新凭据设置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialSettingsRequest {
+    /// 优先级（数字越小优先级越高）
+    pub priority: u32,
+    /// 凭据级 Auth Region（空或 None 表示使用全局配置）
+    pub auth_region: Option<String>,
+    /// 凭据级 API Region（空或 None 表示使用全局配置）
+    pub api_region: Option<String>,
+    /// 凭据级 Machine ID（空或 None 表示使用全局配置/自动派生）
+    pub machine_id: Option<String>,
+    /// 凭据级代理 URL（空或 None 表示使用全局代理，"direct" 表示不用代理）
+    pub proxy_url: Option<String>,
+    /// 凭据级代理用户名
+    pub proxy_username: Option<String>,
+    /// 凭据级代理密码；字段缺失表示保持原密码，空字符串表示清空密码。
+    pub proxy_password: Option<String>,
+    /// 端点名称（空或 None 表示使用全局默认端点）
+    pub endpoint: Option<String>,
 }
 
 /// 添加凭据请求

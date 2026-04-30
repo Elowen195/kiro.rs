@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Settings } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import { CredentialSettingsDialog } from '@/components/credential-settings-dialog'
 import {
   useSetDisabled,
   useSetPriority,
@@ -70,6 +71,16 @@ function formatDisabledReason(reason?: string): string | null {
   }
 }
 
+function formatCooldown(cooldownUntil?: string): string | null {
+  if (!cooldownUntil) return null
+  const until = new Date(cooldownUntil)
+  const diff = until.getTime() - Date.now()
+  if (!Number.isFinite(diff) || diff <= 0) return null
+  const seconds = Math.ceil(diff / 1000)
+  if (seconds < 60) return `冷却 ${seconds} 秒`
+  return `冷却 ${Math.ceil(seconds / 60)} 分钟`
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -81,6 +92,7 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showSettingsDialog, setShowSettingsDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -88,6 +100,7 @@ export function CredentialCard({
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
   const formattedDisabledReason = formatDisabledReason(credential.disabledReason)
+  const cooldownLabel = formatCooldown(credential.cooldownUntil)
   const isSuspended = credential.disabledReason === 'Suspended'
 
   const handleToggleDisabled = () => {
@@ -184,6 +197,9 @@ export function CredentialCard({
                 )}
                 {credential.disabled && formattedDisabledReason && (
                   <Badge variant="outline">{formattedDisabledReason}</Badge>
+                )}
+                {cooldownLabel && (
+                  <Badge variant="outline">{cooldownLabel}</Badge>
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
@@ -310,6 +326,12 @@ export function CredentialCard({
                 <span className="font-medium">{credential.proxyUrl}</span>
               </div>
             )}
+            {credential.lastError && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">最近错误：</span>
+                <span className="font-medium break-all">{credential.lastError}</span>
+              </div>
+            )}
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
@@ -319,6 +341,15 @@ export function CredentialCard({
 
           {/* 操作按钮 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowSettingsDialog(true)}
+              title="设置凭据"
+            >
+              <Settings className="h-4 w-4 mr-1" />
+              设置
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -423,6 +454,12 @@ export function CredentialCard({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <CredentialSettingsDialog
+        credential={credential}
+        open={showSettingsDialog}
+        onOpenChange={setShowSettingsDialog}
+      />
     </>
   )
 }
