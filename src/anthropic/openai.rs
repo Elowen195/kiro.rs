@@ -33,7 +33,9 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request, get_context_window_size};
+use super::converter::{
+    ConversionError, convert_plain_chat_request, convert_request, get_context_window_size,
+};
 use super::handlers::override_thinking_from_model_name;
 use super::middleware::AppState;
 use super::models::fetch_upstream_models;
@@ -234,10 +236,46 @@ pub async fn post_chat_completions(
     State(state): State<AppState>,
     JsonExtractor(req): JsonExtractor<ChatCompletionsRequest>,
 ) -> Response {
+    post_chat_completions_impl(state, req, ChatEndpointMode::AgentCompatible).await
+}
+
+/// POST /chat and /chat/completions
+pub async fn post_plain_chat(
+    State(state): State<AppState>,
+    JsonExtractor(req): JsonExtractor<ChatCompletionsRequest>,
+) -> Response {
+    post_chat_completions_impl(state, req, ChatEndpointMode::PlainChat).await
+}
+
+#[derive(Clone, Copy)]
+enum ChatEndpointMode {
+    AgentCompatible,
+    PlainChat,
+}
+
+impl ChatEndpointMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AgentCompatible => "/v1/chat/completions",
+            Self::PlainChat => "/chat",
+        }
+    }
+
+    fn is_plain_chat(self) -> bool {
+        matches!(self, Self::PlainChat)
+    }
+}
+
+async fn post_chat_completions_impl(
+    state: AppState,
+    mut req: ChatCompletionsRequest,
+    mode: ChatEndpointMode,
+) -> Response {
     tracing::info!(
         model = %req.model,
         stream = %req.stream,
         message_count = %req.messages.len(),
+        endpoint = mode.label(),
         "Received POST /v1/chat/completions request"
     );
 
@@ -258,6 +296,21 @@ pub async fn post_chat_completions(
     let stream = req.stream;
     let model = req.model.clone();
 
+    if mode.is_plain_chat() {
+        if request_contains_tool_history(&req) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "/chat does not accept tool messages or assistant tool_calls",
+                )),
+            )
+                .into_response();
+        }
+        req.tools = None;
+        req.tool_choice = Some(json!("none"));
+    }
+
     // 1. OpenAI → 内部 MessagesRequest
     let mut payload = match openai_to_anthropic(req) {
         Ok(p) => p,
@@ -274,7 +327,11 @@ pub async fn post_chat_completions(
     override_thinking_from_model_name(&mut payload);
 
     // 2. 转换为 Kiro 请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match if mode.is_plain_chat() {
+        convert_plain_chat_request(&payload)
+    } else {
+        convert_request(&payload)
+    } {
         Ok(r) => r,
         Err(e) => {
             let msg = match &e {
@@ -310,7 +367,7 @@ pub async fn post_chat_completions(
         }
     };
 
-    tracing::debug!("Kiro request body (openai): {}", body);
+    tracing::debug!(endpoint = mode.label(), "Kiro request body (openai): {}", body);
 
     // 估算 input_tokens
     let input_tokens = token::count_all_tokens(
@@ -325,6 +382,16 @@ pub async fn post_chat_completions(
     } else {
         handle_non_stream(provider, body, model, input_tokens, tool_name_map).await
     }
+}
+
+fn request_contains_tool_history(req: &ChatCompletionsRequest) -> bool {
+    req.messages.iter().any(|msg| {
+        msg.role == "tool"
+            || msg
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tool_calls| !tool_calls.is_empty())
+    })
 }
 
 // === 请求转换：OpenAI → Anthropic 内部 MessagesRequest ===
@@ -1677,6 +1744,46 @@ mod tests {
         assert_ne!(first_tool_use_id, second_tool_use_id);
         assert!(first_tool_use_id.starts_with("toolu_"));
         assert!(second_tool_use_id.starts_with("toolu_"));
+    }
+
+    #[test]
+    fn test_plain_chat_detects_tool_history() {
+        let req = ChatCompletionsRequest {
+            model: "qwen3-coder-next".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Value::Null,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: "call_report".to_string(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: "report_issue".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Value::String("continue".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            stream: false,
+            max_tokens: Some(128),
+            max_completion_tokens: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+        };
+
+        assert!(request_contains_tool_history(&req));
     }
 
     #[test]

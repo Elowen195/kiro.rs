@@ -315,6 +315,9 @@ async fn main() {
     tracing::info!("启动 API 端点: {}", addr);
     tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
     tracing::info!("可用 API:");
+    tracing::info!("  GET  /models");
+    tracing::info!("  POST /chat");
+    tracing::info!("  POST /chat/completions");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  GET  /cc/v1/models");

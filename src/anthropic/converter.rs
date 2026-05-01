@@ -181,6 +181,25 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
+#[derive(Debug, Clone, Copy)]
+struct ConversionOptions {
+    apply_cli_agent_envelope: bool,
+}
+
+impl ConversionOptions {
+    fn agent_compatible() -> Self {
+        Self {
+            apply_cli_agent_envelope: true,
+        }
+    }
+
+    fn plain_chat() -> Self {
+        Self {
+            apply_cli_agent_envelope: false,
+        }
+    }
+}
+
 /// 从 metadata.user_id 中提取 session UUID
 ///
 /// 支持两种格式:
@@ -511,6 +530,20 @@ fn extend_with_cli_builtin_tools(tools: &mut Vec<Tool>) {
 
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_options(req, ConversionOptions::agent_compatible())
+}
+
+/// 将 Anthropic 请求转换为无工具的纯聊天 Kiro 请求。
+pub fn convert_plain_chat_request(
+    req: &MessagesRequest,
+) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_options(req, ConversionOptions::plain_chat())
+}
+
+fn convert_request_with_options(
+    req: &MessagesRequest,
+    options: ConversionOptions,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -578,7 +611,8 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         &model_id,
         &mut tool_name_map,
     )?;
-    let use_cli_agent_envelope = should_apply_cli_agent_envelope(&model_id);
+    let use_cli_agent_envelope =
+        options.apply_cli_agent_envelope && should_apply_cli_agent_envelope(&model_id);
 
     if use_cli_agent_envelope {
         prepend_cli_default_agent_history(&mut history, &model_id);
@@ -1628,6 +1662,41 @@ mod tests {
                 .user_input_message
                 .content
                 .contains("--- USER MESSAGE BEGIN ---")
+            );
+    }
+
+    #[test]
+    fn test_plain_chat_conversion_skips_cli_agent_envelope_for_non_claude_model() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "qwen3-coder-next".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_plain_chat_request(&req).unwrap();
+        let state = result.conversation_state;
+
+        assert!(state.history.is_empty());
+        assert_eq!(state.current_message.user_input_message.content, "Hello");
+        assert!(
+            state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools
+                .is_empty()
         );
     }
 
