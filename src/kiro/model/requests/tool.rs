@@ -16,16 +16,17 @@ pub struct Tool {
 
 /// 工具规范
 ///
-/// 定义工具的名称、描述和输入模式
+/// 定义工具的名称、描述和输入模式。
+/// 字段顺序对齐官方 kiro-cli：`inputSchema, name, description`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolSpecification {
+    /// 输入模式（JSON Schema）
+    pub input_schema: InputSchema,
     /// 工具名称
     pub name: String,
     /// 工具描述
     pub description: String,
-    /// 输入模式（JSON Schema）
-    pub input_schema: InputSchema,
 }
 
 /// 输入模式

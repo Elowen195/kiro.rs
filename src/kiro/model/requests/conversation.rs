@@ -8,38 +8,42 @@ use super::tool::{Tool, ToolResult, ToolUseEntry};
 
 /// 对话状态
 ///
-/// Kiro API 请求中的核心结构，包含当前消息和历史记录
+/// Kiro API 请求中的核心结构，包含当前消息和历史记录。
+///
+/// 字段顺序与官方 kiro-cli 实际发送的请求保持一致：
+/// `conversationId, history, currentMessage, chatTriggerType, agentContinuationId, agentTaskType`。
+/// JSON 在标准下不依赖字段顺序，但部分 AWS 服务对字段顺序敏感，对齐能减少潜在的 ValidationException 风险。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationState {
+    /// 会话 ID
+    pub conversation_id: String,
+    /// 历史消息列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<Message>,
+    /// 当前消息
+    pub current_message: CurrentMessage,
+    /// 聊天触发类型（"MANUAL" 或 "AUTO"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_trigger_type: Option<String>,
     /// 代理延续 ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_continuation_id: Option<String>,
     /// 代理任务类型（通常为 "vibe"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_task_type: Option<String>,
-    /// 聊天触发类型（"MANUAL" 或 "AUTO"）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_trigger_type: Option<String>,
-    /// 当前消息
-    pub current_message: CurrentMessage,
-    /// 会话 ID
-    pub conversation_id: String,
-    /// 历史消息列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub history: Vec<Message>,
 }
 
 impl ConversationState {
     /// 创建新的对话状态
     pub fn new(conversation_id: impl Into<String>) -> Self {
         Self {
-            agent_continuation_id: None,
-            agent_task_type: None,
-            chat_trigger_type: None,
-            current_message: CurrentMessage::default(),
             conversation_id: conversation_id.into(),
             history: Vec::new(),
+            current_message: CurrentMessage::default(),
+            chat_trigger_type: None,
+            agent_continuation_id: None,
+            agent_task_type: None,
         }
     }
 
@@ -90,33 +94,35 @@ impl CurrentMessage {
 }
 
 /// 用户输入消息
+///
+/// 字段顺序对齐官方 kiro-cli：`content, userInputMessageContext, origin, modelId`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessage {
-    /// 用户输入消息上下文
-    pub user_input_message_context: UserInputMessageContext,
     /// 消息内容
     pub content: String,
+    /// 用户输入消息上下文
+    pub user_input_message_context: UserInputMessageContext,
+    /// 消息来源（通常为 "AI_EDITOR" 或 "KIRO_CLI"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// 模型 ID（CLI 端点下可能留空）
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model_id: String,
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
-    /// 消息来源（通常为 "AI_EDITOR" 或 "KIRO_CLI"）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
 }
 
 impl UserInputMessage {
     /// 创建新的用户输入消息
     pub fn new(content: impl Into<String>, model_id: impl Into<String>) -> Self {
         Self {
-            user_input_message_context: UserInputMessageContext::default(),
             content: content.into(),
+            user_input_message_context: UserInputMessageContext::default(),
+            origin: Some("AI_EDITOR".to_string()),
             model_id: model_id.into(),
             images: Vec::new(),
-            origin: Some("AI_EDITOR".to_string()),
         }
     }
 
@@ -143,6 +149,7 @@ impl UserInputMessage {
 ///
 /// CLI 端点下 userInputMessageContext 必须携带 envState，
 /// 缺失会导致上游返回 400 "Improperly formed request"。
+/// 字段顺序对齐 kiro-cli：`operatingSystem, currentWorkingDirectory`。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvState {
@@ -154,19 +161,20 @@ pub struct EnvState {
 
 /// 用户输入消息上下文
 ///
-/// 包含工具定义和工具执行结果
+/// 包含工具定义和工具执行结果。字段顺序对齐 kiro-cli：
+/// `envState, tools, toolResults`（kiro-cli 真实请求里通常没有 toolResults，所以放在最后）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessageContext {
-    /// 工具执行结果列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_results: Vec<ToolResult>,
-    /// 可用工具列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Tool>,
     /// 环境状态（CLI 端点下必需）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_state: Option<EnvState>,
+    /// 可用工具列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Tool>,
+    /// 工具执行结果列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_results: Vec<ToolResult>,
 }
 
 impl UserInputMessageContext {
@@ -253,23 +261,25 @@ impl HistoryUserMessage {
 }
 
 /// 用户消息（历史记录中使用）
+///
+/// 字段顺序对齐官方 kiro-cli：`content, userInputMessageContext, origin, modelId`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
     /// 消息内容
     pub content: String,
-    /// 模型 ID（CLI 端点下可能留空）
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub model_id: String,
-    /// 消息来源
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
-    /// 图片列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<KiroImage>,
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
+    /// 消息来源
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// 模型 ID（CLI 端点下可能留空）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_id: String,
+    /// 图片列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<KiroImage>,
 }
 
 fn is_default_context(ctx: &UserInputMessageContext) -> bool {
@@ -281,10 +291,10 @@ impl UserMessage {
     pub fn new(content: impl Into<String>, model_id: impl Into<String>) -> Self {
         Self {
             content: content.into(),
-            model_id: model_id.into(),
-            origin: Some("AI_EDITOR".to_string()),
-            images: Vec::new(),
             user_input_message_context: UserInputMessageContext::default(),
+            origin: Some("AI_EDITOR".to_string()),
+            model_id: model_id.into(),
+            images: Vec::new(),
         }
     }
 

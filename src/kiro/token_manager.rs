@@ -65,7 +65,21 @@ fn is_temporarily_suspended_response(status: reqwest::StatusCode, body: &str) ->
 }
 
 fn is_builder_id_profile_resolution_unsupported(status: reqwest::StatusCode, body: &str) -> bool {
-    status.as_u16() == 403 && body.contains("AWS Builder ID is not supported for this operation.")
+    // Builder ID / IdC 个人账号常常不支持 ListAvailableProfiles，上游有两种说法：
+    // - 旧：HTTP 403 + "AWS Builder ID is not supported for this operation."
+    // - 新：HTTP 400/403 + kiro.controlplane#AccessDeniedException
+    //       message="User is not authorized to access this feature."
+    let code = status.as_u16();
+    if code == 403 && body.contains("AWS Builder ID is not supported for this operation.") {
+        return true;
+    }
+    if matches!(code, 400 | 403)
+        && body.contains("User is not authorized to access this feature.")
+        && body.contains("kiro.controlplane")
+    {
+        return true;
+    }
+    false
 }
 
 fn builder_id_placeholder_profile_arn(region: &str) -> String {
@@ -1337,16 +1351,39 @@ impl MultiTokenManager {
                         "凭据 #{} 缺少 profileArn，尝试通过 ListAvailableProfiles 同步",
                         id
                     );
-                    new_creds = sync_profile_arn_if_missing(
+                    // profile_arn 同步失败不应吃掉已经成功的 token 刷新：
+                    // - 上游对个人账号 Builder ID 越来越多地返回 400 AccessDenied，
+                    //   `is_builder_id_profile_resolution_unsupported` 已覆盖常见形式并 fallback 到占位 ARN；
+                    // - 即使遇到没覆盖的 4xx，也只是缺少 profile_arn，不影响 access_token 有效性。
+                    //   把它当成软失败 + 标记 `profile_arn_sync_attempted`，避免循环重试拖死凭据。
+                    match sync_profile_arn_if_missing(
                         &new_creds,
                         &self.config,
                         effective_proxy.as_ref(),
                     )
-                    .await?;
-                    if new_creds.profile_arn.is_some() {
-                        tracing::info!("凭据 #{} 已同步 profileArn", id);
-                    } else {
-                        tracing::warn!("凭据 #{} 未能从 ListAvailableProfiles 获取 profileArn", id);
+                    .await
+                    {
+                        Ok(updated) => {
+                            new_creds = updated;
+                            if new_creds.profile_arn.is_some() {
+                                tracing::info!("凭据 #{} 已同步 profileArn", id);
+                            } else {
+                                tracing::warn!(
+                                    "凭据 #{} 未能从 ListAvailableProfiles 获取 profileArn",
+                                    id
+                                );
+                            }
+                        }
+                        Err(sync_err) => {
+                            if sync_err.downcast_ref::<TemporarilySuspendedError>().is_some() {
+                                return Err(sync_err);
+                            }
+                            tracing::warn!(
+                                "凭据 #{} ListAvailableProfiles 调用失败（不阻断 token 使用）: {}",
+                                id,
+                                sync_err
+                            );
+                        }
                     }
                 }
 
